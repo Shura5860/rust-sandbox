@@ -94,7 +94,8 @@ python3 bindings/python/rsb.py
 | `crates/rsb-ffi` | C ABI shared library (`librsb_ffi.so`). |
 | `crates/rsb-cli` | `rsb` command-line interface (`info`, `run`, `ai-exec`, `learn`, `zygote-bench`). |
 | `bindings/` | C header (`bindings/c/rsb.h`) and Python `ctypes` wrapper (`bindings/python/rsb.py`). |
-| [DEVLOG.md](DEVLOG.md) | Engineering decision log, kernel findings, and audit history. |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Internal design decisions, kernel fallbacks, and known security boundaries. |
+| [CHANGELOG.md](CHANGELOG.md) | Version history and release notes. |
 
 ### Tests & Local Measurements
 
@@ -191,5 +192,5 @@ cargo test --workspace
 
 - **İşletim Sistemi:** Linux (`x86_64`; `aarch64` syscall katmanı dahildir, `rsb learn` şu an yalnızca `x86_64` destekler).
 - **Çekirdek Özellikleri:** Namespace, OverlayFS ve TAP özellikleri için rootless user namespaces (`CLONE_NEWUSER`); dosya yolu kuralları için Landlock LSM (Linux 5.13+); bellek/CPU/PID kotaları için delege edilmiş Cgroups v2 (erişilemediğinde güvenli biçimde atlanır).
-- **Geliştirme Günlüğü:** Mimari kararlar ve çekirdek bulguları [DEVLOG.md](DEVLOG.md) dosyasında yer alır.
+- **Mimari ve Sürüm Geçmişi:** Tasarım kararları ve bilinen sınırlar [ARCHITECTURE.md](ARCHITECTURE.md), sürüm notları [CHANGELOG.md](CHANGELOG.md) dosyasında yer alır.
 - **Lisans:** MIT veya Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).

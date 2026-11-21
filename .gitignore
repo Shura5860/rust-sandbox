@@ -9,3 +9,6 @@
 *~
 __pycache__/
 *.pyc
+
+# Local engineering scratchpad
+DEVLOG.md
