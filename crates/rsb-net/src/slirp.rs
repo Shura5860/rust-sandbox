@@ -345,6 +345,13 @@ impl SlirpBridge {
                     continue;
                 }
                 self.stats.dns_allowed += 1;
+                // Only IPv4 (`A` = 1 or `ANY` = 255) is routed over the IPv4 TAP bridge;
+                // for `AAAA` (28), `HTTPS` (65), etc., reply immediately with NOERROR + 0 answers
+                // so dual-stack resolvers (glibc/curl) do not stall or reject mismatched A records.
+                if q.qtype != 1 && q.qtype != 255 {
+                    immediate_replies.push((meta, build_dns_a_response(data, &q, &[])));
+                    continue;
+                }
                 // Offload blocking host DNS resolution to a background worker so the
                 // SlirpBridge poll loop is never stalled by slow upstream resolvers!
                 let raw_query = data.to_vec();
