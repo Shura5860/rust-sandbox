@@ -108,19 +108,23 @@ pub fn peekdata(pid: i32, addr: usize) -> Result<usize, RawErrno> {
     Ok(word)
 }
 
-/// Read a NUL-terminated byte string from a stopped tracee's memory.
+/// Read a NUL-terminated byte string from a stopped tracee's memory using
+/// word-aligned `PTRACE_PEEKDATA` reads so strings near an unmapped page boundary
+/// never fail with `EIO`/`EFAULT`.
 pub fn read_cstring(pid: i32, addr: u64, max_len: usize) -> Option<Vec<u8>> {
     if addr == 0 {
         return None;
     }
     let word_size = core::mem::size_of::<usize>();
     let mut out = Vec::with_capacity(64);
-    let mut cur = addr as usize;
+    let raw = addr as usize;
+    let mut aligned = raw & !(word_size - 1);
+    let mut skip = raw - aligned;
 
     while out.len() < max_len {
-        let word = peekdata(pid, cur).ok()?;
+        let word = peekdata(pid, aligned).ok()?;
         let bytes = word.to_ne_bytes();
-        for &b in &bytes {
+        for &b in &bytes[skip..] {
             if b == 0 {
                 return Some(out);
             }
@@ -129,7 +133,8 @@ pub fn read_cstring(pid: i32, addr: u64, max_len: usize) -> Option<Vec<u8>> {
                 return Some(out);
             }
         }
-        cur = cur.checked_add(word_size)?;
+        skip = 0;
+        aligned = aligned.checked_add(word_size)?;
     }
 
     Some(out)

@@ -22,8 +22,8 @@ pub fn parse_dns_query(pkt: &[u8]) -> Option<DnsQuery> {
     let tx_id = u16::from_be_bytes([pkt[0], pkt[1]]);
     let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
     let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
-    // Must be a query (QR == 0) with at least 1 question
-    if (flags & 0x8000) != 0 || qdcount == 0 {
+    // Must be a standard query (QR == 0, OPCODE == 0) with exactly 1 question
+    if (flags & 0xF800) != 0 || qdcount != 1 {
         return None;
     }
 
@@ -35,11 +35,17 @@ pub fn parse_dns_query(pkt: &[u8]) -> Option<DnsQuery> {
         if len == 0 {
             break;
         }
-        // Reject pointer compression in queries (malformed/ambiguous)
-        if (len & 0xC0) != 0 || pos + len > pkt.len() {
+        // Reject pointer compression in queries (malformed/ambiguous) and RFC 1035 >255B QNAME
+        if (len & 0xC0) != 0 || pos + len > pkt.len() || (pos + len - 12) > 255 {
             return None;
         }
         let label = core::str::from_utf8(&pkt[pos..pos + len]).ok()?;
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return None;
+        }
         labels.push(label.to_ascii_lowercase());
         pos += len;
     }
@@ -62,7 +68,10 @@ pub fn parse_dns_query(pkt: &[u8]) -> Option<DnsQuery> {
 
 /// Build a valid RFC 1035 `REFUSED` (`RCODE = 5`) DNS response echoing the original question.
 pub fn build_dns_refused(original_query: &[u8], parsed: &DnsQuery) -> Vec<u8> {
-    let mut resp = Vec::with_capacity(parsed.question_end);
+    let qslice = original_query
+        .get(12..parsed.question_end)
+        .unwrap_or(&[]);
+    let mut resp = Vec::with_capacity(12 + qslice.len());
     resp.extend_from_slice(&parsed.tx_id.to_be_bytes());
     // QR=1 (response), RD=copied, RA=1, RCODE=5 (REFUSED)
     let rd = original_query.get(2).copied().unwrap_or(0) & 0x01;
@@ -73,28 +82,37 @@ pub fn build_dns_refused(original_query: &[u8], parsed: &DnsQuery) -> Vec<u8> {
     resp.extend_from_slice(&0u16.to_be_bytes());
     resp.extend_from_slice(&0u16.to_be_bytes());
     resp.extend_from_slice(&0u16.to_be_bytes());
-    resp.extend_from_slice(&original_query[12..parsed.question_end]);
+    resp.extend_from_slice(qslice);
     resp
 }
 
-/// Build a valid RFC 1035 `NOERROR` DNS `A` record response for the given IPv4 addresses.
+/// Build a valid RFC 1035 `NOERROR` DNS `A` record response for the given IPv4 addresses,
+/// staying within the 512-byte classic UDP DNS packet limit (setting `TC` if truncated).
 pub fn build_dns_a_response(
     original_query: &[u8],
     parsed: &DnsQuery,
     ips: &[std::net::Ipv4Addr],
 ) -> Vec<u8> {
-    let mut resp = Vec::with_capacity(parsed.question_end + ips.len() * 16);
+    let qslice = original_query
+        .get(12..parsed.question_end)
+        .unwrap_or(&[]);
+    let base_len = 12 + qslice.len();
+    let max_answers = 512usize.saturating_sub(base_len) / 16;
+    let take = ips.len().min(max_answers);
+    let tc_bit = if take < ips.len() { 0x02 } else { 0x00 };
+
+    let mut resp = Vec::with_capacity(base_len + take * 16);
     resp.extend_from_slice(&parsed.tx_id.to_be_bytes());
     let rd = original_query.get(2).copied().unwrap_or(0) & 0x01;
-    resp.push(0x80 | rd); // QR=1, RD copied
-    resp.push(0x80);      // RA=1, RCODE=0 (NOERROR)
+    resp.push(0x80 | tc_bit | rd); // QR=1, optional TC, RD copied
+    resp.push(0x80);               // RA=1, RCODE=0 (NOERROR)
     resp.extend_from_slice(&1u16.to_be_bytes());
-    resp.extend_from_slice(&(ips.len() as u16).to_be_bytes());
+    resp.extend_from_slice(&(take as u16).to_be_bytes());
     resp.extend_from_slice(&0u16.to_be_bytes());
     resp.extend_from_slice(&0u16.to_be_bytes());
-    resp.extend_from_slice(&original_query[12..parsed.question_end]);
+    resp.extend_from_slice(qslice);
 
-    for ip in ips {
+    for ip in &ips[..take] {
         resp.extend_from_slice(&[0xC0, 0x0C]); // Name pointer to offset 12 (QNAME)
         resp.extend_from_slice(&1u16.to_be_bytes());  // TYPE = A
         resp.extend_from_slice(&1u16.to_be_bytes());  // CLASS = IN

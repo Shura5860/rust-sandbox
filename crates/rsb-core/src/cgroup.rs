@@ -149,6 +149,9 @@ impl CgroupGuard {
 
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
+        // Best-effort kill any lingering processes in the cgroup (Linux 5.14+)
+        // so `remove_dir` does not fail with EBUSY and leak the cgroup directory.
+        let _ = fs::write(self.dir.join("cgroup.kill"), b"1");
         let _ = fs::remove_dir(&self.dir);
     }
 }

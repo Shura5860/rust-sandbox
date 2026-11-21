@@ -343,7 +343,7 @@ pub fn is_private_or_metadata(ip: IpAddr) -> bool {
 }
 
 fn is_private_v4(v4: Ipv4Addr) -> bool {
-    let [a, b, _, _] = v4.octets();
+    let [a, b, c, _] = v4.octets();
     v4.is_loopback()          // 127.0.0.0/8
         || v4.is_private()    // 10/8, 172.16/12, 192.168/16
         || v4.is_link_local() // 169.254.0.0/16 (AWS/GCP/Azure metadata!)
@@ -351,6 +351,10 @@ fn is_private_v4(v4: Ipv4Addr) -> bool {
         || v4.is_multicast()
         || a == 0             // 0.0.0.0/8
         || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 (CGNAT)
+        || (a == 192 && b == 0 && c == 0)        // 192.0.0.0/24 (IETF protocol assignments)
+        || (a == 192 && b == 88 && c == 99)      // 192.88.99.0/24 (deprecated 6to4 relay)
+        || (a == 198 && (b == 18 || b == 19))    // 198.18.0.0/15 (benchmarking)
+        || a >= 240                               // 240.0.0.0/4 (reserved / Class E)
 }
 
 #[cfg(test)]

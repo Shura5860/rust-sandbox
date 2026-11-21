@@ -25,10 +25,15 @@ pub fn configure_tap_ipv4(
     netmask: Ipv4Addr,
     gateway: Ipv4Addr,
 ) -> Result<(), std::io::Error> {
-    let mut name_buf = [0u8; 16];
     let bytes = ifname.as_bytes();
-    let n = bytes.len().min(15);
-    name_buf[..n].copy_from_slice(&bytes[..n]);
+    if bytes.is_empty() || bytes.len() > 15 || bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TAP interface name must be 1..=15 bytes without NUL",
+        ));
+    }
+    let mut name_buf = [0u8; 16];
+    name_buf[..bytes.len()].copy_from_slice(bytes);
     rsb_sys::tap::configure_tap_ipv4_raw(&name_buf, ip, netmask, gateway)
         .map_err(|e| e.to_io_error())
 }

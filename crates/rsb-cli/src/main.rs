@@ -472,7 +472,7 @@ fn cmd_ai_exec(args: &[String]) -> ExitCode {
         Ok(Some(p)) => p,
         Ok(None) => return ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("rsb ai-exec: {msg}");
+            println!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&msg));
             return ExitCode::from(2);
         }
     };
@@ -506,6 +506,8 @@ fn cmd_ai_exec(args: &[String]) -> ExitCode {
                 ExitCode::from(124)
             } else if let Some(code) = cap.report.exit_code {
                 ExitCode::from((code & 0xFF) as u8)
+            } else if let Some(sig) = cap.report.signal {
+                ExitCode::from(((128 + sig) & 0xFF) as u8)
             } else {
                 ExitCode::from(1)
             }
@@ -694,7 +696,8 @@ fn json_escape(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }
@@ -708,6 +711,10 @@ fn cmd_zygote_bench(args: &[String]) -> ExitCode {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "-h" | "--help" => {
+                println!("USAGE: rsb zygote-bench [--no-ns] [--iters <N>]");
+                return ExitCode::SUCCESS;
+            }
             "--no-ns" => use_ns = false,
             "--iters" => {
                 i += 1;
@@ -749,6 +756,15 @@ fn cmd_zygote_bench(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if !cold.report.success() {
+        eprintln!(
+            "rsb zygote-bench (cold) failed: exit={:?} signal={:?} stderr={}",
+            cold.report.exit_code,
+            cold.report.signal,
+            String::from_utf8_lossy(&cold.stderr)
+        );
+        return ExitCode::from(1);
+    }
     let cold_ms = cold.report.total_time.as_secs_f64() * 1000.0;
 
     // 2. Start warm Zygote pool

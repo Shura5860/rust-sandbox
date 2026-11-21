@@ -100,6 +100,11 @@ impl PreparedSandbox {
         }
         let mut envp_storage = Vec::with_capacity(env_map.len());
         for (k, v) in env_map {
+            if k.is_empty() || k.as_bytes().contains(&b'=') {
+                return Err(SandboxError::InvalidPolicy(
+                    "environment variable key must be non-empty and cannot contain '='".into(),
+                ));
+            }
             let mut bytes = Vec::with_capacity(k.len() + 1 + v.len());
             bytes.extend_from_slice(k.as_bytes());
             bytes.push(b'=');
@@ -201,12 +206,15 @@ impl PreparedSandbox {
             (None, 0, Vec::new())
         };
 
-        // Compile pure-Rust Seccomp-BPF bytecode in parent (zero-alloc in child)
+        // Compile pure-Rust Seccomp-BPF bytecode in parent (zero-alloc in child).
+        // Linux `seccomp(SECCOMP_SET_MODE_FILTER)` enforces `BPF_MAXINSNS` (4096).
+        const BPF_MAXINSNS: usize = 4096;
         let seccomp_bpf = policy.seccomp.compile();
-        if seccomp_bpf.len() > u16::MAX as usize {
-            return Err(SandboxError::InvalidPolicy(
-                "compiled Seccomp-BPF program exceeds u16::MAX instructions".into(),
-            ));
+        if seccomp_bpf.len() > BPF_MAXINSNS {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "compiled Seccomp-BPF program ({} instructions) exceeds kernel BPF_MAXINSNS ({BPF_MAXINSNS})",
+                seccomp_bpf.len()
+            )));
         }
 
         Ok(Self {

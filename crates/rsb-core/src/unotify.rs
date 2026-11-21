@@ -201,12 +201,15 @@ where
                                 error: 0,
                                 flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
                             },
-                            UnotifyDecision::Errno(e) => SeccompNotifResp {
-                                id: notif.id,
-                                val: 0,
-                                error: -(e.abs()),
-                                flags: 0,
-                            },
+                            UnotifyDecision::Errno(e) => {
+                                let code = e.unsigned_abs().clamp(1, 4095) as i32;
+                                SeccompNotifResp {
+                                    id: notif.id,
+                                    val: 0,
+                                    error: -code,
+                                    flags: 0,
+                                }
+                            }
                             UnotifyDecision::ReturnValue(v) => SeccompNotifResp {
                                 id: notif.id,
                                 val: v,

@@ -203,7 +203,7 @@ impl PreparedSandbox {
         );
 
         let clone_res = match unsafe { clone3(&mut clone_args) } {
-            Err(RawErrno(38)) if used_clone_into_cgroup => {
+            Err(RawErrno(38 | 22 | 13 | 95)) if used_clone_into_cgroup => {
                 used_clone_into_cgroup = false;
                 clone_args.flags &= !flags::CLONE_INTO_CGROUP;
                 clone_args.cgroup = 0;
@@ -268,6 +268,7 @@ impl PreparedSandbox {
             }
             if let Err(e) = write(&sync_tx, b"K") {
                 drop(sync_tx);
+                kill_sandbox_child(child_pid, self.namespaces.enabled);
                 reap_child(child_pid);
                 return Err(SandboxError::Syscall {
                     stage: "write(sync_tx)",
@@ -285,6 +286,7 @@ impl PreparedSandbox {
                 Ok(n) => filled += n,
                 Err(Errno::INTR) => continue,
                 Err(e) => {
+                    kill_sandbox_child(child_pid, self.namespaces.enabled);
                     reap_child(child_pid);
                     return Err(SandboxError::Syscall {
                         stage: "read(err_rx)",
@@ -302,6 +304,13 @@ impl PreparedSandbox {
             return Err(SandboxError::ChildSetupFailed {
                 stage: ChildStage::from_u32(stage_id),
                 errno: RawErrno(errno),
+            });
+        } else if filled > 0 {
+            kill_sandbox_child(child_pid, self.namespaces.enabled);
+            reap_child(child_pid);
+            return Err(SandboxError::ChildSetupFailed {
+                stage: ChildStage::Unknown,
+                errno: RawErrno(5), // EIO
             });
         }
 
@@ -426,18 +435,38 @@ impl PreparedSandbox {
         }
 
         // Optional SCM_RIGHTS socketpair + temporary `/etc/resolv.conf` for live TAP bridge
-        let tap_setup = if on_tap.is_some() && self.namespaces.enabled {
+        let tap_setup = if on_tap.is_some() {
+            if !(self.namespaces.enabled && self.namespaces.isolate_network) {
+                return Err(SandboxError::InvalidPolicy(
+                    "transparent TAP networking requires namespaces(true) with isolate_network(true)".into(),
+                ));
+            }
             let (parent_sock, child_sock) =
                 unix_socketpair().map_err(|errno| SandboxError::Syscall {
                     stage: "socketpair(tap)",
                     errno,
                 })?;
             let seq = RESOLV_SEQ.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
             let resolv_path = std::env::temp_dir().join(format!(
-                "rsb-resolv-{}-{seq}.conf",
-                getpid().as_raw_nonzero().get()
+                "rsb-resolv-{}-{seq}-{:x}.conf",
+                getpid().as_raw_nonzero().get(),
+                nanos ^ (&seq as *const u64 as usize as u64),
             ));
-            let _ = std::fs::write(&resolv_path, b"nameserver 10.0.2.2\n");
+            {
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(0x20000) // O_NOFOLLOW
+                    .open(&resolv_path)?;
+                f.write_all(b"nameserver 10.0.2.2\n")?;
+            }
             let resolv_cstr = CString::new(resolv_path.as_os_str().as_bytes()).ok();
             Some((parent_sock, child_sock, TempFileGuard(resolv_path), resolv_cstr))
         } else {
@@ -469,8 +498,8 @@ impl PreparedSandbox {
         // SAFETY: `child_main` performs strictly async-signal-safe operations
         // with zero heap allocation before `execve` / `exit_group`.
         let clone_res = match unsafe { clone3(&mut clone_args) } {
-            Err(RawErrno(38)) if used_clone_into_cgroup => {
-                // Outer seccomp returned ENOSYS for clone3(CLONE_INTO_CGROUP); retry without it
+            Err(RawErrno(38 | 22 | 13 | 95)) if used_clone_into_cgroup => {
+                // Kernel or outer seccomp rejected clone3(CLONE_INTO_CGROUP); retry without it
                 // and fall back to writing `cgroup.procs` before waking child.
                 used_clone_into_cgroup = false;
                 clone_args.flags &= !flags::CLONE_INTO_CGROUP;

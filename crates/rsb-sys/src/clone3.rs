@@ -72,8 +72,17 @@ pub unsafe fn clone3(args: &mut CloneArgs) -> Result<CloneResult, RawErrno> {
     };
     let val = match RawErrno::from_raw_ret(ret) {
         Ok(v) => v,
-        Err(RawErrno(ENOSYS)) if (args.flags >> 32) == 0 && args.stack == 0 => {
-            let legacy_flags = (args.flags as usize) | (args.exit_signal as usize);
+        Err(RawErrno(ENOSYS))
+            if (args.flags >> 32) == 0
+                && args.stack == 0
+                && args.pidfd == 0
+                && args.child_tid == 0
+                && args.parent_tid == 0
+                && args.tls == 0
+                && args.set_tid == 0
+                && args.exit_signal <= 0xff =>
+        {
+            let legacy_flags = (args.flags as usize) | ((args.exit_signal as usize) & 0xff);
             let fallback_ret = unsafe { syscall5(SYS_CLONE, legacy_flags, 0, 0, 0, 0) };
             RawErrno::from_raw_ret(fallback_ret)?
         }
