@@ -62,9 +62,22 @@ impl CowSession {
         }
 
         let seq = COW_SEQ.fetch_add(1, Ordering::Relaxed);
-        let staging_root =
-            std::env::temp_dir().join(format!("rsb-cow-{}-{}", std::process::id(), seq));
-        fs::create_dir_all(&staging_root)?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let staging_root = std::env::temp_dir().join(format!(
+            "rsb-cow-{}-{}-{:x}",
+            std::process::id(),
+            seq,
+            nanos ^ (&seq as *const u64 as usize as u64),
+        ));
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&staging_root)?;
+        }
 
         let mut mounts = Vec::with_capacity(targets.len());
         for (idx, raw_target) in targets.iter().enumerate() {
@@ -72,8 +85,12 @@ impl CowSession {
             let slot = staging_root.join(format!("m{idx}"));
             let upper = slot.join("upper");
             let work = slot.join("work");
-            fs::create_dir_all(&upper)?;
-            fs::create_dir_all(&work)?;
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new().mode(0o700).create(&slot)?;
+                std::fs::DirBuilder::new().mode(0o700).create(&upper)?;
+                std::fs::DirBuilder::new().mode(0o700).create(&work)?;
+            }
 
             let target_cstr = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
                 std::io::Error::new(
@@ -123,7 +140,24 @@ impl CowSession {
 
 impl Drop for CowSession {
     fn drop(&mut self) {
+        // Restore owner rwx on directories in case the sandbox ran `chmod 0000` / `0555`
+        // inside `upperdir`, which would otherwise cause `remove_dir_all` to fail with EACCES.
+        make_tree_removable(&self.staging_root);
         let _ = fs::remove_dir_all(&self.staging_root);
+    }
+}
+
+fn make_tree_removable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::symlink_metadata(dir)
+        && meta.is_dir()
+    {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                make_tree_removable(&entry.path());
+            }
+        }
     }
 }
 
@@ -163,8 +197,9 @@ pub(crate) fn collect_upper_diff(
             continue;
         }
 
+        let lower_exists = fs::symlink_metadata(&lower_path).is_ok();
         if meta.is_dir() {
-            if !lower_path.exists() {
+            if !lower_exists {
                 out.push(CowChange {
                     target: lower_root.to_path_buf(),
                     rel_path: rel.clone(),
@@ -173,7 +208,7 @@ pub(crate) fn collect_upper_diff(
             }
             collect_upper_diff(lower_root, upper_root, &rel, out);
         } else {
-            let kind = if lower_path.exists() {
+            let kind = if lower_exists {
                 CowChangeKind::Modified
             } else {
                 CowChangeKind::Added

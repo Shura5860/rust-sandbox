@@ -106,6 +106,9 @@ impl Drop for EgressProxy {
 
 fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()> {
     let _ = client.set_nonblocking(false);
+    // Enforce an absolute wall-clock deadline across the entire HTTP header read phase
+    // so a slowloris client trickling 1 byte every 9s cannot hold connection slots for days.
+    let header_deadline = std::time::Instant::now() + Duration::from_secs(10);
     let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = client.set_write_timeout(Some(Duration::from_secs(10)));
 
@@ -120,10 +123,17 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
         BoundedLine::Ok => {}
     }
 
-    // Drain remaining HTTP headers with strict line-length and header-count bounds (anti-OOM)
+    // Drain remaining HTTP headers with strict line-length, header-count, and total-time bounds
     let mut hdr = String::new();
     let mut hdr_count = 0usize;
+    let mut saw_end_of_headers = false;
     loop {
+        let now = std::time::Instant::now();
+        if now >= header_deadline {
+            let _ = client.write_all(b"HTTP/1.1 408 Request Timeout\r\n\r\n");
+            return Ok(());
+        }
+        let _ = client.set_read_timeout(Some(header_deadline.saturating_duration_since(now)));
         hdr.clear();
         match read_bounded_line(&mut reader, &mut hdr, MAX_HEADER_LINE_BYTES)? {
             BoundedLine::Eof => break,
@@ -133,6 +143,7 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
             }
             BoundedLine::Ok => {
                 if hdr == "\r\n" || hdr == "\n" {
+                    saw_end_of_headers = true;
                     break;
                 }
                 hdr_count += 1;
@@ -142,6 +153,9 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
                 }
             }
         }
+    }
+    if !saw_end_of_headers {
+        return Ok(());
     }
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
@@ -206,50 +220,64 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
             allowed
         };
 
-        // Acknowledge tunnel establishment so client sends TLS ClientHello
+        // Acknowledge tunnel establishment
         client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
         client.flush()?;
 
-        // 3. Buffer the first client TLS record (handles segmented ClientHello!) and verify SNI
-        let mut first_buf = Vec::with_capacity(512);
-        let mut chunk = [0u8; 2048];
-        loop {
-            let n = reader.read(&mut chunk)?;
-            if n == 0 {
-                break;
-            }
-            first_buf.extend_from_slice(&chunk[..n]);
-            if first_buf.len() >= 4096 {
-                break;
-            }
-            if !(policy.verify_tls_sni && port == 443 && validated_domain.is_some()) {
-                break;
-            }
-            // If first byte isn't TLS Handshake (0x16), no need to wait for more bytes
-            if first_buf[0] != 0x16 {
-                break;
-            }
-            if let Some(expected_len) = tls_record_expected_len(&first_buf)
-                && first_buf.len() >= expected_len.min(4096)
-            {
-                break;
-            }
-        }
-        if first_buf.is_empty() {
-            return Ok(());
-        }
-
-        if policy.verify_tls_sni
-            && port == 443
-            && let Some(expected_host) = validated_domain
-        {
-            match extract_tls_sni(&first_buf) {
-                Some(ref sni)
-                    if sni.eq_ignore_ascii_case(expected_host)
-                        && policy.check_domain(sni, Some(port)).is_allowed() => {}
-                _ => {
-                    // SNI mismatch or missing SNI on HTTPS tunnel -> drop immediately!
+        // 3. Only buffer initial client bytes BEFORE connecting upstream when TLS SNI
+        //    verification is active; otherwise connect immediately so server-speaks-first
+        //    protocols (SSH, SMTP, IMAP, MySQL) do not deadlock!
+        //    Raise the TLS ClientHello cap to RFC 8446 max single record (16,389 bytes)
+        //    so post-quantum TLS 1.3 (X25519MLKEM768) key shares are never truncated.
+        const MAX_CLIENT_HELLO_BYTES: usize = 16_384 + 5;
+        let check_sni = policy.verify_tls_sni && validated_domain.is_some();
+        let mut first_buf = Vec::new();
+        if check_sni {
+            let sni_deadline = std::time::Instant::now() + Duration::from_secs(10);
+            first_buf.reserve(512);
+            let mut chunk = [0u8; 4096];
+            loop {
+                let now = std::time::Instant::now();
+                if now >= sni_deadline {
                     return Ok(());
+                }
+                let _ = client.set_read_timeout(Some(sni_deadline.saturating_duration_since(now)));
+                let n = reader.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                first_buf.extend_from_slice(&chunk[..n]);
+                if first_buf.len() >= MAX_CLIENT_HELLO_BYTES {
+                    break;
+                }
+                // If first byte isn't TLS Handshake (0x16), stop buffering immediately
+                if first_buf[0] != 0x16 {
+                    break;
+                }
+                if let Some(expected_len) = tls_record_expected_len(&first_buf)
+                    && first_buf.len() >= expected_len.min(MAX_CLIENT_HELLO_BYTES)
+                {
+                    break;
+                }
+            }
+            if first_buf.is_empty() {
+                return Ok(());
+            }
+
+            let is_tls_handshake = first_buf.len() >= 2 && first_buf[0] == 0x16 && first_buf[1] == 0x03;
+            // Require TLS + matching SNI on port 443, AND whenever TLS is detected on any other port!
+            if (port == 443 || is_tls_handshake)
+                && let Some(expected_host) = validated_domain
+            {
+                let expected_norm = expected_host.trim_end_matches('.');
+                match extract_tls_sni(&first_buf) {
+                    Some(ref sni)
+                        if sni.eq_ignore_ascii_case(expected_norm)
+                            && policy.check_domain(sni, Some(port)).is_allowed() => {}
+                    _ => {
+                        // SNI mismatch, ECH, or missing SNI on HTTPS/TLS tunnel -> drop immediately!
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -265,7 +293,10 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
         let Some(mut upstream) = upstream_opt else {
             return Ok(());
         };
-        upstream.write_all(&first_buf)?;
+        if !first_buf.is_empty() {
+            let _ = upstream.set_write_timeout(Some(Duration::from_secs(10)));
+            upstream.write_all(&first_buf)?;
+        }
 
         // Handshake and SNI validation are complete; switch from the 10s handshake
         // timeout to a 5-minute tunnel idle timeout so long downloads/streams do not

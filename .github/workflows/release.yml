@@ -20,13 +20,22 @@ jobs:
       - name: Allow unprivileged userns capabilities on Ubuntu 24.04 runners
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          if [[ "${TAG_VER}" != "${CARGO_VER}"* ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VER}" >&2
+            exit 1
+          fi
+
       - name: Run test suite
         run: cargo test --workspace
 
       - name: Build release artifacts
         run: cargo build --workspace --release
 
-      - name: Package release archive & checksums
+      - name: Package & smoke-test release archive
         run: |
           TAG="${GITHUB_REF_NAME}"
           PKG="rust-sandbox-${TAG}-x86_64-unknown-linux-gnu"
@@ -36,6 +45,8 @@ jobs:
           cp bindings/c/rsb.h "dist/${PKG}/include/rsb.h"
           cp bindings/python/rsb.py "dist/${PKG}/python/rsb.py"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${PKG}/"
+          "dist/${PKG}/rsb" info
+          python3 "dist/${PKG}/python/rsb.py"
           (cd dist && tar -czf "${PKG}.tar.gz" "${PKG}" && sha256sum "${PKG}.tar.gz" > SHA256SUMS.txt)
 
       - name: Publish GitHub Release
@@ -43,8 +54,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
+          EXTRA_FLAGS=""
+          if [[ "${TAG}" == *-* ]]; then
+            EXTRA_FLAGS="--prerelease"
+          fi
           gh release create "${TAG}" \
             "dist/rust-sandbox-${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
             "dist/SHA256SUMS.txt" \
             --title "rust-sandbox ${TAG}" \
-            --generate-notes
+            --generate-notes ${EXTRA_FLAGS}

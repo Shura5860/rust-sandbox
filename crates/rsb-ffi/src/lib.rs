@@ -45,17 +45,21 @@ pub unsafe extern "C" fn rsb_exec_json(
     allow_network: i32,
     use_namespaces: i32,
 ) -> *mut c_char {
-    let json = match run_ffi_impl(
-        program,
-        argv,
-        argc,
-        rw_dir,
-        timeout_ms,
-        allow_network != 0,
-        use_namespaces != 0,
-    ) {
-        Ok(s) => s,
-        Err(msg) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&msg)),
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_ffi_impl(
+            program,
+            argv,
+            argc,
+            rw_dir,
+            timeout_ms,
+            allow_network != 0,
+            use_namespaces != 0,
+        )
+    }));
+    let json = match res {
+        Ok(Ok(s)) => s,
+        Ok(Err(msg)) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&msg)),
+        Err(_) => "{\"ok\":false,\"error\":\"internal panic in rsb_exec_json\"}".to_string(),
     };
 
     CString::new(json)
@@ -70,32 +74,38 @@ pub unsafe extern "C" fn rsb_exec_json(
 /// `rsb_zygote_exec_json` that has not already been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rsb_string_free(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        drop(unsafe { CString::from_raw(ptr) });
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !ptr.is_null() {
+            drop(unsafe { CString::from_raw(ptr) });
+        }
+    }));
 }
 
 /// Start a pre-warmed, sandboxed Python 3 Zygote fork server and return an opaque handle.
 /// Returns NULL on failure. Free with [`rsb_zygote_free`].
 #[unsafe(no_mangle)]
 pub extern "C" fn rsb_zygote_start_python(allow_network: i32, use_namespaces: i32) -> *mut ZygotePool {
-    let cfg = ZygoteConfig {
-        namespaces: use_namespaces != 0,
-        landlock: landlock_abi_version().is_ok(),
-        seccomp: true,
-        allow_network: allow_network != 0,
-        ..Default::default()
-    };
-    match ZygotePool::start_python(cfg) {
-        Ok(pool) => Box::into_raw(Box::new(pool)),
-        Err(_) => core::ptr::null_mut(),
-    }
+    let res = std::panic::catch_unwind(|| {
+        let cfg = ZygoteConfig {
+            namespaces: use_namespaces != 0,
+            landlock: landlock_abi_version().is_ok(),
+            seccomp: true,
+            allow_network: allow_network != 0,
+            ..Default::default()
+        };
+        match ZygotePool::start_python(cfg) {
+            Ok(pool) => Box::into_raw(Box::new(pool)),
+            Err(_) => core::ptr::null_mut(),
+        }
+    });
+    res.unwrap_or(core::ptr::null_mut())
 }
 
 /// Execute Python `code` inside a live `ZygotePool` handle and return a heap-allocated JSON report.
 ///
 /// # Safety
 /// - `pool` must be a valid non-NULL handle returned by [`rsb_zygote_start_python`].
+/// - `pool` is NOT thread-safe; callers must serialize concurrent calls on the same handle.
 /// - `code` must be a valid NUL-terminated UTF-8 C string.
 /// - Caller MUST free the returned string with [`rsb_string_free`].
 #[unsafe(no_mangle)]
@@ -104,34 +114,39 @@ pub unsafe extern "C" fn rsb_zygote_exec_json(
     code: *const c_char,
     timeout_ms: u64,
 ) -> *mut c_char {
-    let json = if pool.is_null() || code.is_null() {
-        "{\"ok\":false,\"error\":\"null pool or code pointer\"}".to_string()
-    } else {
-        let pool_ref = unsafe { &mut *pool };
-        match unsafe { CStr::from_ptr(code) }.to_str() {
-            Ok(src) => {
-                let dur = if timeout_ms > 0 {
-                    Duration::from_millis(timeout_ms)
-                } else {
-                    Duration::from_secs(5)
-                };
-                match pool_ref.exec(src, dur) {
-                    Ok(res) => format!(
-                        "{{\"ok\":{},\"exit_code\":{},\"timed_out\":{},\"roundtrip_ms\":{:.3},\"fork_exec_us\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
-                        res.success(),
-                        res.exit_code,
-                        res.timed_out,
-                        res.roundtrip_time.as_secs_f64() * 1000.0,
-                        res.fork_exec_us,
-                        json_escape(&res.stdout),
-                        json_escape(&res.stderr),
-                    ),
-                    Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&e.to_string())),
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if pool.is_null() || code.is_null() {
+            "{\"ok\":false,\"error\":\"null pool or code pointer\"}".to_string()
+        } else {
+            let pool_ref = unsafe { &mut *pool };
+            match unsafe { CStr::from_ptr(code) }.to_str() {
+                Ok(src) => {
+                    let dur = if timeout_ms > 0 {
+                        Duration::from_millis(timeout_ms)
+                    } else {
+                        Duration::from_secs(5)
+                    };
+                    match pool_ref.exec(src, dur) {
+                        Ok(res) => format!(
+                            "{{\"ok\":{},\"exit_code\":{},\"timed_out\":{},\"roundtrip_ms\":{:.3},\"fork_exec_us\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
+                            res.success(),
+                            res.exit_code,
+                            res.timed_out,
+                            res.roundtrip_time.as_secs_f64() * 1000.0,
+                            res.fork_exec_us,
+                            json_escape(&res.stdout),
+                            json_escape(&res.stderr),
+                        ),
+                        Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&e.to_string())),
+                    }
                 }
+                Err(_) => "{\"ok\":false,\"error\":\"code is not valid UTF-8\"}".to_string(),
             }
-            Err(_) => "{\"ok\":false,\"error\":\"code is not valid UTF-8\"}".to_string(),
         }
-    };
+    }));
+    let json = res.unwrap_or_else(|_| {
+        "{\"ok\":false,\"error\":\"internal panic in rsb_zygote_exec_json\"}".to_string()
+    });
 
     CString::new(json)
         .unwrap_or_else(|_| CString::new("{\"ok\":false,\"error\":\"nul in output\"}").unwrap())
@@ -144,10 +159,12 @@ pub unsafe extern "C" fn rsb_zygote_exec_json(
 /// `pool` must either be NULL or a valid handle that has not already been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rsb_zygote_free(pool: *mut ZygotePool) {
-    if !pool.is_null() {
-        let boxed = unsafe { Box::from_raw(pool) };
-        boxed.shutdown();
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !pool.is_null() {
+            let boxed = unsafe { Box::from_raw(pool) };
+            boxed.shutdown();
+        }
+    }));
 }
 
 fn run_ffi_impl(
@@ -159,19 +176,27 @@ fn run_ffi_impl(
     allow_network: bool,
     use_namespaces: bool,
 ) -> Result<String, String> {
+    const MAX_ARGC: usize = 65_536;
     if program.is_null() {
         return Err("program pointer is null".into());
+    }
+    if argv.is_null() && argc > 0 {
+        return Err("argv is null while argc > 0".into());
+    }
+    if argc > MAX_ARGC {
+        return Err(format!("argc ({argc}) exceeds maximum allowed ({MAX_ARGC})"));
     }
     let prog_str = unsafe { CStr::from_ptr(program) }
         .to_str()
         .map_err(|_| "program is not valid UTF-8")?;
 
-    let mut args = Vec::with_capacity(argc);
+    let mut args = Vec::new();
     if !argv.is_null() && argc > 0 {
+        args.reserve_exact(argc);
         for i in 0..argc {
             let p = unsafe { *argv.add(i) };
             if p.is_null() {
-                continue;
+                return Err(format!("argv[{i}] is null"));
             }
             let s = unsafe { CStr::from_ptr(p) }
                 .to_str()

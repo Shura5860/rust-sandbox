@@ -177,9 +177,29 @@ pub fn recv_fd(sock_fd: RawFd) -> Result<OwnedFd, RawErrno> {
         msg_flags: 0,
         _pad1: 0,
     };
-    let ret = unsafe { syscall3(SYS_RECVMSG, sock_fd as usize, &mut msg as *mut MsgHdr as usize, 0) };
-    let n = RawErrno::from_raw_ret(ret)?;
-    if cmsg.cmsg_level == SOL_SOCKET && cmsg.cmsg_type == SCM_RIGHTS && cmsg.fd >= 0 {
+    const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
+    const MSG_CTRUNC: i32 = 0x08;
+    let n = loop {
+        let ret = unsafe {
+            syscall3(
+                SYS_RECVMSG,
+                sock_fd as usize,
+                &mut msg as *mut MsgHdr as usize,
+                MSG_CMSG_CLOEXEC,
+            )
+        };
+        match RawErrno::from_raw_ret(ret) {
+            Ok(v) => break v,
+            Err(RawErrno(4)) => continue, // EINTR
+            Err(e) => return Err(e),
+        }
+    };
+    if (msg.msg_flags & MSG_CTRUNC) == 0
+        && msg.msg_controllen >= core::mem::size_of::<CmsgFdBuf>()
+        && cmsg.cmsg_level == SOL_SOCKET
+        && cmsg.cmsg_type == SCM_RIGHTS
+        && cmsg.fd >= 0
+    {
         return Ok(unsafe { OwnedFd::from_raw_fd(cmsg.fd) });
     }
     if n == 4 {

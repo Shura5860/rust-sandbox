@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -13,9 +14,20 @@ def _find_library() -> Path:
     env_path = os.environ.get("RSB_FFI_LIB")
     if env_path:
         return Path(env_path)
-    repo_root = Path(__file__).resolve().parents[2]
-    for profile in ("release", "debug"):
-        cand = repo_root / "target" / profile / "librsb_ffi.so"
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "librsb_ffi.so",
+        here.parent / "librsb_ffi.so",
+    ]
+    if len(here.parents) >= 2:
+        repo_root = here.parents[1]
+        candidates.extend(
+            [
+                repo_root / "target" / "release" / "librsb_ffi.so",
+                repo_root / "target" / "debug" / "librsb_ffi.so",
+            ]
+        )
+    for cand in candidates:
         if cand.is_file():
             return cand
     raise FileNotFoundError(
@@ -23,12 +35,20 @@ def _find_library() -> Path:
     )
 
 
+def _encode_c_str(value: str, field: str) -> bytes:
+    if "\x00" in value:
+        raise ValueError(f"{field} must not contain NUL bytes")
+    return value.encode("utf-8")
+
+
 class RustSandboxFFI:
     def __init__(self, lib_path: str | os.PathLike[str] | None = None) -> None:
         path = Path(lib_path) if lib_path else _find_library()
         self._lib = ctypes.CDLL(str(path))
 
+        self._lib.rsb_version.argtypes = []
         self._lib.rsb_version.restype = ctypes.c_char_p
+        self._lib.rsb_landlock_abi.argtypes = []
         self._lib.rsb_landlock_abi.restype = ctypes.c_int32
 
         self._lib.rsb_exec_json.argtypes = [
@@ -80,12 +100,16 @@ class RustSandboxFFI:
         allow_network: bool = False,
         use_namespaces: bool = True,
     ) -> dict[str, Any]:
+        if isinstance(command, (str, bytes)):
+            raise TypeError("command must be a sequence of arguments, not a string or bytes")
         if not command:
             raise ValueError("command must not be empty")
-        prog = command[0].encode("utf-8")
-        rest = [a.encode("utf-8") for a in command[1:]]
+        if timeout_ms < 0:
+            raise ValueError("timeout_ms must be >= 0")
+        prog = _encode_c_str(command[0], "command[0]")
+        rest = [_encode_c_str(a, f"command[{i + 1}]") for i, a in enumerate(command[1:])]
         argv_arr = (ctypes.c_char_p * len(rest))(*rest) if rest else None
-        rw_bytes = rw_dir.encode("utf-8") if rw_dir else None
+        rw_bytes = _encode_c_str(rw_dir, "rw_dir") if rw_dir else None
 
         raw_ptr = self._lib.rsb_exec_json(
             prog,
@@ -99,7 +123,7 @@ class RustSandboxFFI:
         if not raw_ptr:
             raise RuntimeError("rsb_exec_json returned NULL")
         try:
-            payload = ctypes.cast(raw_ptr, ctypes.c_char_p).value.decode("utf-8")
+            payload = ctypes.string_at(raw_ptr).decode("utf-8")
             return json.loads(payload)
         finally:
             self._lib.rsb_string_free(raw_ptr)
@@ -108,26 +132,39 @@ class RustSandboxFFI:
 class PythonZygote:
     def __init__(self, lib: ctypes.CDLL, handle: int) -> None:
         self._lib = lib
+        self._free_fn = lib.rsb_zygote_free
         self._handle: int | None = handle
+        self._lock = threading.Lock()
 
     def exec(self, code: str, *, timeout_ms: int = 5000) -> dict[str, Any]:
-        if not self._handle:
-            raise RuntimeError("Zygote pool already closed")
-        raw_ptr = self._lib.rsb_zygote_exec_json(
-            self._handle, code.encode("utf-8"), timeout_ms
-        )
-        if not raw_ptr:
-            raise RuntimeError("rsb_zygote_exec_json returned NULL")
-        try:
-            payload = ctypes.cast(raw_ptr, ctypes.c_char_p).value.decode("utf-8")
-            return json.loads(payload)
-        finally:
-            self._lib.rsb_string_free(raw_ptr)
+        if timeout_ms < 0:
+            raise ValueError("timeout_ms must be >= 0")
+        code_bytes = _encode_c_str(code, "code")
+        with self._lock:
+            if not self._handle:
+                raise RuntimeError("Zygote pool already closed")
+            raw_ptr = self._lib.rsb_zygote_exec_json(
+                self._handle, code_bytes, timeout_ms
+            )
+            if not raw_ptr:
+                raise RuntimeError("rsb_zygote_exec_json returned NULL")
+            try:
+                payload = ctypes.string_at(raw_ptr).decode("utf-8")
+                return json.loads(payload)
+            finally:
+                self._lib.rsb_string_free(raw_ptr)
 
     def close(self) -> None:
-        if self._handle:
-            self._lib.rsb_zygote_free(self._handle)
-            self._handle = None
+        with self._lock:
+            if self._handle:
+                self._free_fn(self._handle)
+                self._handle = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self) -> "PythonZygote":
         return self

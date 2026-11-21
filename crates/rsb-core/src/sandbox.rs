@@ -578,9 +578,14 @@ impl PreparedSandbox {
             drop(child_sock);
             if let Some(cb) = on_tap {
                 match recv_fd(parent_sock.as_raw_fd()) {
-                    Ok(tap_fd) => {
-                        _tap_guard = Some(cb(tap_fd)?);
-                    }
+                    Ok(tap_fd) => match cb(tap_fd) {
+                        Ok(guard) => _tap_guard = Some(guard),
+                        Err(e) => {
+                            kill_sandbox_child(child_pid, self.namespaces.enabled);
+                            reap_child(child_pid);
+                            return Err(e);
+                        }
+                    },
                     Err(_) => {
                         // Child likely failed at TapSetup and wrote to `err_rx`; let `err_rx` report exact stage!
                     }
@@ -788,21 +793,25 @@ fn wait_and_capture(
         drain_pipe(out_rx, &mut tmp, stdout_buf, max_bytes, stdout_truncated);
         drain_pipe(err_rx, &mut tmp, stderr_buf, max_bytes, stderr_truncated);
 
-        // 4. Done when child has exited AND both pipes hit EOF.
-        if let Some(status) = exit_status
-            && out_rx.is_none()
-            && err_rx.is_none()
-        {
-            return Ok((status, timed_out));
+        // 4. Done when child has exited AND both pipes hit EOF — OR if child has already
+        //    exited and the deadline expired (e.g., an escaped grandchild holds stdout/stderr open).
+        if let Some(status) = exit_status {
+            let pipes_closed = out_rx.is_none() && err_rx.is_none();
+            let past_deadline = deadline.is_some_and(|dl| Instant::now() >= dl);
+            if pipes_closed || timed_out || past_deadline {
+                *out_rx = None;
+                *err_rx = None;
+                return Ok((status, timed_out));
+            }
         }
 
         // 5. Poll open pipes with a short timeout so we stay responsive to deadlines.
         let poll_timeout_ms: i64 = match deadline {
-            Some(dl) if exit_status.is_none() => {
+            Some(dl) => {
                 let rem = dl.saturating_duration_since(Instant::now());
                 (rem.as_millis() as i64).clamp(1, 10)
             }
-            _ => 10,
+            None => 10,
         };
         let ts = Timespec {
             tv_sec: poll_timeout_ms / 1000,

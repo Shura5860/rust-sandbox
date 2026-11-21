@@ -10,6 +10,7 @@
 pub mod cgroup;
 mod child;
 pub mod error;
+#[cfg(target_arch = "x86_64")]
 pub mod learn;
 pub mod overlay;
 pub mod policy;

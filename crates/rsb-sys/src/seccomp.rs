@@ -132,12 +132,18 @@ pub fn close_range_cloexec(first: u32, last: u32) -> Result<(), RawErrno> {
     RawErrno::from_raw_ret(ret).map(|_| ())
 }
 
-/// Drop all Linux capabilities from the bounding set (`PR_CAPBSET_DROP`) and
-/// clear effective, permitted, and inheritable capability sets via `capset(2)`.
+/// Drop all Linux capabilities from the ambient set (`PR_CAP_AMBIENT_CLEAR_ALL`),
+/// bounding set (`PR_CAPBSET_DROP`), and effective/permitted/inheritable sets (`capset`).
 ///
-/// Essential inside rootless user namespaces where `uid=0` otherwise starts with
-/// a full capability set (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_BPF`, etc.).
-pub fn drop_all_capabilities() {
+/// Essential both inside rootless user namespaces (where `uid=0` otherwise starts with
+/// full capabilities) and when invoked from a privileged host process with `--no-ns`.
+pub fn drop_all_capabilities() -> Result<(), RawErrno> {
+    const PR_CAP_AMBIENT: usize = 47;
+    const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
+
+    // Best-effort clear ambient capabilities (EINVAL on kernels < 4.3)
+    let _ = unsafe { syscall5(SYS_PRCTL, PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) };
+
     // Drop bounding set capabilities (Linux currently defines caps 0..=40; stop on EINVAL)
     for cap in 0..=63usize {
         let ret = unsafe { syscall5(SYS_PRCTL, PR_CAPBSET_DROP, cap, 0, 0, 0) };
@@ -153,13 +159,14 @@ pub fn drop_all_capabilities() {
         pid: 0,
     };
     let data = [CapUserData::default(); 2];
-    unsafe {
-        let _ = syscall2(
+    let ret = unsafe {
+        syscall2(
             SYS_CAPSET,
             &hdr as *const CapUserHeader as usize,
             data.as_ptr() as usize,
-        );
-    }
+        )
+    };
+    RawErrno::from_raw_ret(ret).map(|_| ())
 }
 
 /// Apply a POSIX/Linux `rlimit` (`RLIMIT_CORE`, `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, etc.).

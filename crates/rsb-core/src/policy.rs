@@ -196,7 +196,6 @@ impl SandboxBuilder {
             "/etc/nsswitch.conf",
             "/etc/passwd",
             "/etc/group",
-            "/dev/null",
             "/dev/zero",
             "/dev/urandom",
             "/dev/random",
@@ -217,6 +216,12 @@ impl SandboxBuilder {
                     access: AccessMode::ReadOnly,
                 });
             }
+        }
+        if Path::new("/dev/null").exists() {
+            self.policy.fs_rules.push(FsRule {
+                path: PathBuf::from("/dev/null"),
+                access: AccessMode::ReadWrite,
+            });
         }
         self
     }

@@ -137,10 +137,21 @@ impl PreparedSandbox {
 
             let mut rules = Vec::with_capacity(policy.fs_rules.len());
             for rule in &policy.fs_rules {
-                // When pivoting into a dedicated `rootfs`, resolve metadata against the
-                // rootfs directory and gracefully skip host-only paths absent in the rootfs.
+                // When pivoting into a dedicated `rootfs`, reject `..` traversal and resolve
+                // metadata against the rootfs directory (using symlink_metadata fallback so
+                // absolute symlinks like `/bin/sh -> /bin/busybox` inside rootfs still work).
                 let host_check_path = match policy.rootfs {
                     Some(ref root) => {
+                        if rule
+                            .path
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                        {
+                            return Err(SandboxError::InvalidPolicy(format!(
+                                "Landlock rule path '{}' cannot contain '..' when rootfs is set",
+                                rule.path.display()
+                            )));
+                        }
                         let rel = rule.path.strip_prefix("/").unwrap_or(&rule.path);
                         root.join(rel)
                     }
@@ -149,7 +160,12 @@ impl PreparedSandbox {
 
                 let meta = match std::fs::metadata(&host_check_path) {
                     Ok(m) => m,
-                    Err(_) if policy.rootfs.is_some() => continue,
+                    Err(_) if policy.rootfs.is_some() => {
+                        match std::fs::symlink_metadata(&host_check_path) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        }
+                    }
                     Err(e) => {
                         return Err(SandboxError::InvalidPolicy(format!(
                             "cannot stat Landlock rule path '{}': {e}",

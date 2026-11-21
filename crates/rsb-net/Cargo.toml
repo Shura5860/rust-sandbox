@@ -2,6 +2,7 @@
 name = "rsb-net"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Zero-C-dependency L3/L4/L7 egress filter, TLS SNI verifier, DNS filter, and smoltcp rootless TAP bridge for rust-sandbox"
 

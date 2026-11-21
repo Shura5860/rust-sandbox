@@ -111,6 +111,20 @@ def write_all(fd, data):
 def send_frame(fd, payload):
     write_all(fd, struct.pack(">I", len(payload)) + payload)
 
+# Duplicate protocol FDs away from 0/1 and redirect FD 0 & FD 1 to /dev/null BEFORE
+# preloading modules so preload stdout cannot corrupt the binary protocol and forked
+# workers cannot read host request bytes from stdin (FD 0)!
+proto_in = os.dup(0)
+proto_out = os.dup(1)
+os.set_inheritable(proto_in, False)
+os.set_inheritable(proto_out, False)
+_devnull_r = os.open("/dev/null", os.O_RDONLY)
+os.dup2(_devnull_r, 0)
+os.close(_devnull_r)
+_devnull_w = os.open("/dev/null", os.O_WRONLY)
+os.dup2(_devnull_w, 1)
+os.close(_devnull_w)
+
 # Preload requested modules once into warm address space
 for mod in sys.argv[1:]:
     if mod:
@@ -118,16 +132,6 @@ for mod in sys.argv[1:]:
             __import__(mod)
         except Exception:
             pass
-
-# Duplicate protocol FDs away from 0/1 and redirect FD 0 to /dev/null so forked
-# workers cannot read host request bytes from stdin (FD 0) or corrupt the protocol!
-proto_in = os.dup(0)
-proto_out = os.dup(1)
-os.set_inheritable(proto_in, False)
-os.set_inheritable(proto_out, False)
-_devnull = os.open("/dev/null", os.O_RDONLY)
-os.dup2(_devnull, 0)
-os.close(_devnull)
 
 send_frame(proto_out, b"READY")
 
@@ -333,7 +337,12 @@ const { spawnSync } = require('child_process');
 function writeAll(fd, buf) {
   let off = 0;
   while (off < buf.length) {
-    off += fs.writeSync(fd, buf, off, buf.length - off);
+    try {
+      off += fs.writeSync(fd, buf, off, buf.length - off);
+    } catch (e) {
+      if (e.code === 'EINTR' || e.code === 'EAGAIN') continue;
+      throw e;
+    }
   }
 }
 
@@ -344,7 +353,10 @@ function sendFrame(buf) {
   writeAll(1, buf);
 }
 
+const MAX_FRAME = 16 * 1024 * 1024;
+
 function readExact(n) {
+  if (n > MAX_FRAME) return null;
   const out = Buffer.alloc(n);
   let off = 0;
   while (off < n) {
@@ -353,7 +365,7 @@ function readExact(n) {
       if (r === 0) return null;
       off += r;
     } catch (e) {
-      if (e.code === 'EAGAIN') continue;
+      if (e.code === 'EINTR' || e.code === 'EAGAIN') continue;
       return null;
     }
   }
@@ -366,6 +378,7 @@ while (true) {
   const hdr = readExact(4);
   if (!hdr) break;
   const len = hdr.readUInt32BE(0);
+  if (len > MAX_FRAME) break;
   const body = readExact(len);
   if (!body || body.length < 4) break;
 
@@ -375,12 +388,21 @@ while (true) {
 
   // Separate OS process per request: inherits Landlock + Seccomp-BPF from kernel,
   // has zero access to Zygote memory or protocol FDs 0/1!
-  const res = spawnSync(process.execPath, ['-e', code], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: timeoutMs > 0 ? timeoutMs : undefined,
-    maxBuffer: 1024 * 1024,
-    killSignal: 'SIGKILL',
-  });
+  let res;
+  try {
+    if (code.indexOf('\0') !== -1) {
+      res = { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from('code contains NUL byte\n') };
+    } else {
+      res = spawnSync(process.execPath, ['-e', code], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: timeoutMs > 0 ? timeoutMs : undefined,
+        maxBuffer: 1024 * 1024,
+        killSignal: 'SIGKILL',
+      });
+    }
+  } catch (e) {
+    res = { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from(String(e) + '\n') };
+  }
 
   const elapsedUs = Number((process.hrtime.bigint() - t0) / 1000n);
   const timedOut = (res.error && res.error.code === 'ETIMEDOUT') ? 1 : 0;
@@ -434,8 +456,11 @@ impl ZygotePool {
         let mut child = builder.prepare()?.spawn_piped()?;
         let req_tx = child.stdin.take().expect("piped stdin");
         let resp_rx = child.stdout.take().expect("piped stdout");
+        if let Some(stderr_rx) = child.stderr.take() {
+            spawn_stderr_drainer(stderr_rx);
+        }
 
-        let ready = read_frame(&resp_rx)?;
+        let ready = read_frame_deadline(&resp_rx, Some(Instant::now() + Duration::from_secs(10)))?;
         if ready != b"READY" {
             return Err(SandboxError::InvalidPolicy(format!(
                 "node zygote failed to initialize: expected READY, got {:?}",
@@ -476,8 +501,11 @@ impl ZygotePool {
         let mut child = builder.prepare()?.spawn_piped()?;
         let req_tx = child.stdin.take().expect("piped stdin");
         let resp_rx = child.stdout.take().expect("piped stdout");
+        if let Some(stderr_rx) = child.stderr.take() {
+            spawn_stderr_drainer(stderr_rx);
+        }
 
-        let ready = read_frame(&resp_rx)?;
+        let ready = read_frame_deadline(&resp_rx, Some(Instant::now() + Duration::from_secs(10)))?;
         if ready != b"READY" {
             return Err(SandboxError::InvalidPolicy(format!(
                 "zygote failed to initialize: expected READY, got {:?}",
@@ -493,18 +521,44 @@ impl ZygotePool {
         })
     }
 
-    /// Execute Python `code` inside a fresh Copy-on-Write forked worker of this Zygote.
+    /// Execute code inside a fresh isolated worker of this Zygote.
     pub fn exec(&mut self, code: &str, timeout: Duration) -> Result<ZygoteExecResult, SandboxError> {
         let t0 = Instant::now();
-        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        let timeout_ms: u32 = if timeout.is_zero() {
+            0
+        } else {
+            timeout.as_millis().clamp(1, u32::MAX as u128) as u32
+        };
 
         let mut payload = Vec::with_capacity(4 + code.len());
         payload.extend_from_slice(&timeout_ms.to_be_bytes());
         payload.extend_from_slice(code.as_bytes());
-        write_frame(&self.req_tx, &payload)?;
+        if payload.len() > MAX_ZYGOTE_FRAME_BYTES {
+            return Err(SandboxError::InvalidPolicy(
+                "zygote request exceeds 16 MiB frame limit".into(),
+            ));
+        }
+        if let Err(e) = write_frame(&self.req_tx, &payload) {
+            self.child.kill_and_wait();
+            return Err(e);
+        }
 
-        let resp = read_frame(&self.resp_rx)?;
+        // Enforce a host-side deadline (worker timeout + 2s grace) so a hung Zygote
+        // cannot block the caller indefinitely.
+        let host_deadline = if timeout.is_zero() {
+            None
+        } else {
+            Some(Instant::now() + timeout + Duration::from_secs(2))
+        };
+        let resp = match read_frame_deadline(&self.resp_rx, host_deadline) {
+            Ok(r) => r,
+            Err(e) => {
+                self.child.kill_and_wait();
+                return Err(e);
+            }
+        };
         if resp.len() < 17 {
+            self.child.kill_and_wait();
             return Err(SandboxError::InvalidPolicy(
                 "truncated response frame from zygote".into(),
             ));
@@ -516,8 +570,12 @@ impl ZygotePool {
             resp[5], resp[6], resp[7], resp[8], resp[9], resp[10], resp[11], resp[12],
         ]);
         let out_len = u32::from_be_bytes([resp[13], resp[14], resp[15], resp[16]]) as usize;
-        let out_end = 17 + out_len;
-        if resp.len() < out_end + 4 {
+        let Some(out_end) = 17usize.checked_add(out_len) else {
+            self.child.kill_and_wait();
+            return Err(SandboxError::InvalidPolicy("invalid stdout length in zygote response".into()));
+        };
+        if resp.len() < out_end.saturating_add(4) {
+            self.child.kill_and_wait();
             return Err(SandboxError::InvalidPolicy(
                 "truncated stdout in zygote response".into(),
             ));
@@ -530,7 +588,16 @@ impl ZygotePool {
             resp[out_end + 3],
         ]) as usize;
         let err_start = out_end + 4;
-        let err_end = (err_start + err_len).min(resp.len());
+        let Some(err_end) = err_start.checked_add(err_len) else {
+            self.child.kill_and_wait();
+            return Err(SandboxError::InvalidPolicy("invalid stderr length in zygote response".into()));
+        };
+        if err_end != resp.len() {
+            self.child.kill_and_wait();
+            return Err(SandboxError::InvalidPolicy(
+                "truncated or malformed stderr in zygote response".into(),
+            ));
+        }
         let stderr = String::from_utf8_lossy(&resp[err_start..err_end]).into_owned();
 
         Ok(ZygoteExecResult {
@@ -571,9 +638,61 @@ fn write_all_fd(fd: &OwnedFd, mut buf: &[u8]) -> Result<(), SandboxError> {
     Ok(())
 }
 
-fn read_exact_fd(fd: &OwnedFd, buf: &mut [u8]) -> Result<(), SandboxError> {
+fn spawn_stderr_drainer(stderr_rx: OwnedFd) {
+    let _ = std::thread::Builder::new()
+        .name("rsb-zygote-stderr".into())
+        .spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match read(&stderr_rx, &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(Errno::INTR) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+}
+
+fn read_exact_fd_deadline(
+    fd: &OwnedFd,
+    buf: &mut [u8],
+    deadline: Option<Instant>,
+) -> Result<(), SandboxError> {
+    use rsb_sys::rustix::event::{PollFd, PollFlags, Timespec, poll};
     let mut filled = 0usize;
     while filled < buf.len() {
+        if let Some(dl) = deadline {
+            let now = Instant::now();
+            if now >= dl {
+                return Err(SandboxError::Syscall {
+                    stage: "read(zygote host timeout)",
+                    errno: RawErrno(110), // ETIMEDOUT
+                });
+            }
+            let rem = dl.saturating_duration_since(now);
+            let ts = Timespec {
+                tv_sec: rem.as_secs() as i64,
+                tv_nsec: rem.subsec_nanos() as i64,
+            };
+            let mut pfd = [PollFd::new(fd, PollFlags::IN)];
+            match poll(&mut pfd, Some(&ts)) {
+                Ok(0) => {
+                    return Err(SandboxError::Syscall {
+                        stage: "read(zygote host timeout)",
+                        errno: RawErrno(110), // ETIMEDOUT
+                    });
+                }
+                Ok(_) => {}
+                Err(Errno::INTR) => continue,
+                Err(e) => {
+                    return Err(SandboxError::Syscall {
+                        stage: "poll(zygote)",
+                        errno: RawErrno(e.raw_os_error()),
+                    });
+                }
+            }
+        }
         match read(fd, &mut buf[filled..]) {
             Ok(0) => {
                 return Err(SandboxError::Syscall {
@@ -595,16 +714,18 @@ fn read_exact_fd(fd: &OwnedFd, buf: &mut [u8]) -> Result<(), SandboxError> {
 }
 
 fn write_frame(fd: &OwnedFd, payload: &[u8]) -> Result<(), SandboxError> {
-    let len = (payload.len() as u32).to_be_bytes();
+    let len = u32::try_from(payload.len())
+        .map_err(|_| SandboxError::InvalidPolicy("zygote frame exceeds u32::MAX".into()))?
+        .to_be_bytes();
     write_all_fd(fd, &len)?;
     write_all_fd(fd, payload)
 }
 
 const MAX_ZYGOTE_FRAME_BYTES: usize = 16 * 1024 * 1024; // 16 MiB anti-OOM cap
 
-fn read_frame(fd: &OwnedFd) -> Result<Vec<u8>, SandboxError> {
+fn read_frame_deadline(fd: &OwnedFd, deadline: Option<Instant>) -> Result<Vec<u8>, SandboxError> {
     let mut hdr = [0u8; 4];
-    read_exact_fd(fd, &mut hdr)?;
+    read_exact_fd_deadline(fd, &mut hdr, deadline)?;
     let len = u32::from_be_bytes(hdr) as usize;
     if len > MAX_ZYGOTE_FRAME_BYTES {
         return Err(SandboxError::InvalidPolicy(format!(
@@ -612,6 +733,6 @@ fn read_frame(fd: &OwnedFd) -> Result<Vec<u8>, SandboxError> {
         )));
     }
     let mut buf = vec![0u8; len];
-    read_exact_fd(fd, &mut buf)?;
+    read_exact_fd_deadline(fd, &mut buf, deadline)?;
     Ok(buf)
 }

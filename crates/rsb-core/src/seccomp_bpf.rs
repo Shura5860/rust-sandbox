@@ -65,11 +65,8 @@ const CLONE_NS_FLAGS: u32 = 0x0002_0000 // CLONE_NEWNS
 // BPF_JSET opcode for bitmask testing in `clone(flags)`
 const BPF_JSET: u16 = 0x40;
 
-// Socket address families
-const AF_INET: u32 = 2;
-const AF_INET6: u32 = 10;
-const AF_NETLINK: u32 = 16;
-const AF_PACKET: u32 = 17;
+// Socket address family allowed when network sockets are blocked
+const AF_UNIX: u32 = 1;
 
 // Dangerous terminal injection ioctl request codes
 const TIOCSTI: u32 = 0x5412;
@@ -80,6 +77,7 @@ const TIOCLINUX: u32 = 0x541C;
 pub mod nr {
     pub const IOCTL: u32 = 16;
     pub const SOCKET: u32 = 41;
+    pub const SOCKETPAIR: u32 = 53;
     pub const CLONE: u32 = 56;
     pub const EXECVE: u32 = 59;
     pub const EXIT: u32 = 60;
@@ -131,6 +129,7 @@ pub mod nr {
 pub mod nr {
     pub const IOCTL: u32 = 29;
     pub const SOCKET: u32 = 198;
+    pub const SOCKETPAIR: u32 = 199;
     pub const CLONE: u32 = 220;
     pub const EXECVE: u32 = 221;
     pub const EXIT: u32 = 93;
@@ -284,18 +283,18 @@ impl SeccompPolicy {
             asm.ld_abs_w(OFFSET_NR);
         }
 
-        // 4. Network socket domain filter (blocks IPv4, IPv6, Netlink, Packet sockets;
-        //    preserves AF_UNIX so local IPC/runtimes still work).
+        // 4. Network socket domain filter: allowlist `AF_UNIX` only on BOTH `socket` and
+        //    `socketpair` (blocks AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_VSOCK,
+        //    AF_BLUETOOTH, AF_ALG, AF_XDP, AF_CAN, AF_TIPC, AF_KEY, etc. with EPERM).
         if self.block_network_sockets {
-            const BLOCKED_DOMAINS: &[u32] = &[AF_INET, AF_INET6, AF_NETLINK, AF_PACKET];
-            let skip = (2 + 2 * BLOCKED_DOMAINS.len()) as u8;
-            asm.jeq_k(nr::SOCKET, 0, skip);
-            asm.ld_abs_w(OFFSET_ARG0_LO);
-            for &dom in BLOCKED_DOMAINS {
-                asm.jeq_k(dom, 0, 1);
-                asm.ret_k(SeccompAction::Errno(EPERM).to_bpf_ret());
+            let eperm_ret = SeccompAction::Errno(EPERM).to_bpf_ret();
+            for &sock_nr in &[nr::SOCKET, nr::SOCKETPAIR] {
+                asm.jeq_k(sock_nr, 0, 4);
+                asm.ld_abs_w(OFFSET_ARG0_LO);
+                asm.jeq_k(AF_UNIX, 1, 0);
+                asm.ret_k(eperm_ret);
+                asm.ld_abs_w(OFFSET_NR);
             }
-            asm.ld_abs_w(OFFSET_NR);
         }
 
         // 5a. Strict Allowlist Mode (default-deny everything not explicitly allowed).

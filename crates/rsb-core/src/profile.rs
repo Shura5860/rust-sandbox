@@ -89,6 +89,9 @@ impl SandboxProfile {
     pub fn from_toml(input: &str) -> Result<Self, SandboxError> {
         let mut profile = Self::default();
         let mut section = String::new();
+        let mut seen_sections = std::collections::BTreeSet::new();
+        let mut seen_keys = std::collections::BTreeSet::new();
+        let mut seccomp_mode: Option<String> = None;
 
         for (line_idx, raw_line) in input.lines().enumerate() {
             let line_no = line_idx + 1;
@@ -98,7 +101,18 @@ impl SandboxProfile {
             }
 
             if line.starts_with('[') && line.ends_with(']') {
-                section = line[1..line.len() - 1].trim().to_string();
+                let sec = line[1..line.len() - 1].trim();
+                if !matches!(sec, "isolation" | "limits" | "filesystem" | "network" | "seccomp") {
+                    return Err(SandboxError::InvalidPolicy(format!(
+                        "sandbox.toml line {line_no}: unknown section `[{sec}]`"
+                    )));
+                }
+                if !seen_sections.insert(sec.to_string()) {
+                    return Err(SandboxError::InvalidPolicy(format!(
+                        "sandbox.toml line {line_no}: duplicate section `[{sec}]`"
+                    )));
+                }
+                section = sec.to_string();
                 continue;
             }
 
@@ -109,6 +123,11 @@ impl SandboxProfile {
             };
             let key = k.trim();
             let val = v.trim();
+            if !seen_keys.insert((section.clone(), key.to_string())) {
+                return Err(SandboxError::InvalidPolicy(format!(
+                    "sandbox.toml line {line_no}: duplicate key `{section}.{key}`"
+                )));
+            }
 
             match (section.as_str(), key) {
                 ("isolation", "namespaces") => profile.namespaces = parse_bool(val, line_no)?,
@@ -120,8 +139,8 @@ impl SandboxProfile {
                 }
                 ("isolation", "hostname") => profile.hostname = Some(parse_string(val, line_no)?),
                 ("limits", "memory_mb") => profile.memory_mb = Some(parse_u64(val, line_no)?),
-                ("limits", "pids") => profile.pids = Some(parse_u64(val, line_no)? as u32),
-                ("limits", "cpu_pct") => profile.cpu_pct = Some(parse_u64(val, line_no)? as u32),
+                ("limits", "pids") => profile.pids = Some(parse_u32(val, line_no)?),
+                ("limits", "cpu_pct") => profile.cpu_pct = Some(parse_u32(val, line_no)?),
                 ("limits", "timeout_ms") => profile.timeout_ms = Some(parse_u64(val, line_no)?),
                 ("filesystem", "ro") => profile.ro = parse_path_array(val, line_no)?,
                 ("filesystem", "ro_data") => profile.ro_data = parse_path_array(val, line_no)?,
@@ -154,6 +173,7 @@ impl SandboxProfile {
                             "sandbox.toml line {line_no}: seccomp.mode must be `allowlist` or `denylist`"
                         )));
                     }
+                    seccomp_mode = Some(mode);
                 }
                 ("seccomp", "allow_syscalls") => {
                     profile.allow_syscalls = Some(parse_u32_array(val, line_no)?);
@@ -163,6 +183,19 @@ impl SandboxProfile {
                         "sandbox.toml line {line_no}: unknown key `{sec}.{unknown}`"
                     )));
                 }
+            }
+        }
+
+        if let Some(mode) = seccomp_mode {
+            if mode == "allowlist" && profile.allow_syscalls.is_none() {
+                return Err(SandboxError::InvalidPolicy(
+                    "sandbox.toml: seccomp.mode = \"allowlist\" requires `allow_syscalls`".into(),
+                ));
+            }
+            if mode == "denylist" && profile.allow_syscalls.is_some() {
+                return Err(SandboxError::InvalidPolicy(
+                    "sandbox.toml: seccomp.mode = \"denylist\" cannot be combined with `allow_syscalls`".into(),
+                ));
             }
         }
 
@@ -325,6 +358,15 @@ fn parse_u64(val: &str, line_no: usize) -> Result<u64, SandboxError> {
     })
 }
 
+fn parse_u32(val: &str, line_no: usize) -> Result<u32, SandboxError> {
+    let n = parse_u64(val, line_no)?;
+    u32::try_from(n).map_err(|_| {
+        SandboxError::InvalidPolicy(format!(
+            "sandbox.toml line {line_no}: integer `{val}` exceeds u32::MAX"
+        ))
+    })
+}
+
 fn parse_string(val: &str, line_no: usize) -> Result<String, SandboxError> {
     if !(val.starts_with('"') && val.ends_with('"') && val.len() >= 2) {
         return Err(SandboxError::InvalidPolicy(format!(
@@ -335,14 +377,30 @@ fn parse_string(val: &str, line_no: usize) -> Result<String, SandboxError> {
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
+        if c == '"' {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "sandbox.toml line {line_no}: unescaped `\"` inside string `{val}`"
+            )));
+        }
         if c == '\\' {
             match chars.next() {
                 Some('"') => out.push('"'),
                 Some('\\') => out.push('\\'),
                 Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
                 Some('t') => out.push('\t'),
-                Some(other) => out.push(other),
-                None => break,
+                Some('b') => out.push('\u{0008}'),
+                Some('f') => out.push('\u{000C}'),
+                Some(other) => {
+                    return Err(SandboxError::InvalidPolicy(format!(
+                        "sandbox.toml line {line_no}: unsupported escape `\\{other}`"
+                    )));
+                }
+                None => {
+                    return Err(SandboxError::InvalidPolicy(format!(
+                        "sandbox.toml line {line_no}: unterminated escape sequence in `{val}`"
+                    )));
+                }
             }
         } else {
             out.push(c);
@@ -414,7 +472,7 @@ fn parse_u32_array(val: &str, line_no: usize) -> Result<Vec<u32>, SandboxError> 
         if s.is_empty() {
             continue;
         }
-        let n = parse_u64(s, line_no)? as u32;
+        let n = parse_u32(s, line_no)?;
         items.push(n);
     }
     Ok(items)
@@ -433,7 +491,19 @@ fn format_u32_array(nums: &[u32]) -> String {
 }
 
 fn escape_toml_str(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn format_path_array(paths: &[PathBuf]) -> String {

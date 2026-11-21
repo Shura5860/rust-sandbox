@@ -2,6 +2,7 @@
 name = "rsb-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Embeddable, zero-C-dependency Linux sandbox engine (Namespaces + Landlock + Seccomp)"
 

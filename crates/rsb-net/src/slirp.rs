@@ -299,6 +299,11 @@ impl SlirpBridge {
         dst_port: u16,
         validated_domain: Option<String>,
     ) {
+        // Cap concurrent TCP flows to prevent host OOM from guest SYN floods.
+        const MAX_TCP_CONNS: usize = 128;
+        if self.tcp_conns.len() >= MAX_TCP_CONNS {
+            return;
+        }
         // Avoid duplicating an already-listening socket for the same destination
         for c in &self.tcp_conns {
             let sock = self.sockets.get::<tcp::Socket>(c.handle);
@@ -372,8 +377,11 @@ impl SlirpBridge {
             }
         }
 
-        // Drain completed async DNS lookups and update `dns_cache`
+        // Drain completed async DNS lookups and update `dns_cache` (bounded anti-OOM cap)
         while let Ok(reply) = self.dns_rx.try_recv() {
+            if self.dns_cache.len() >= 1024 {
+                self.dns_cache.clear();
+            }
             for ip in reply.resolved_ips {
                 self.dns_cache.insert(ip, reply.qname.clone());
             }
@@ -415,8 +423,11 @@ impl SlirpBridge {
                 }
             }
 
-            // 2. Guest -> Host relay (with segmented TLS ClientHello SNI buffering on port 443)
-            if sock.can_recv() {
+            // 2. Guest -> Host relay (bounded `tx_pending` for TCP backpressure, plus
+            //    TLS ClientHello SNI verification up to 16,389B on port 443 and any TLS port)
+            const MAX_TX_PENDING: usize = 64 * 1024;
+            const MAX_CLIENT_HELLO_BYTES: usize = 16_384 + 5;
+            if sock.can_recv() && conn.tx_pending.len() < MAX_TX_PENDING {
                 let recv_bytes: Vec<u8> = sock
                     .recv(|buf| {
                         let copy = buf.to_vec();
@@ -427,31 +438,39 @@ impl SlirpBridge {
                 if !recv_bytes.is_empty() {
                     let needs_sni = !conn.sni_checked
                         && self.policy.verify_tls_sni
-                        && conn.dst_port == 443
                         && conn.validated_domain.is_some();
 
                     if needs_sni {
                         conn.sni_buf.extend_from_slice(&recv_bytes);
-                        let ready = conn.sni_buf.len() >= 4096
-                            || conn.sni_buf[0] != 0x16
+                        let is_tls = conn.sni_buf[0] == 0x16;
+                        let ready = conn.sni_buf.len() >= MAX_CLIENT_HELLO_BYTES
+                            || !is_tls
                             || tls_record_expected_len(&conn.sni_buf)
-                                .is_some_and(|need| conn.sni_buf.len() >= need.min(4096));
+                                .is_some_and(|need| conn.sni_buf.len() >= need.min(MAX_CLIENT_HELLO_BYTES));
 
                         if ready {
                             conn.sni_checked = true;
-                            let expected = conn.validated_domain.as_deref().unwrap_or("");
-                            let valid = match extract_tls_sni(&conn.sni_buf) {
-                                Some(ref sni) => {
-                                    sni.eq_ignore_ascii_case(expected)
-                                        && self.policy.check_domain(sni, Some(443)).is_allowed()
+                            let is_tls_handshake = conn.sni_buf.len() >= 2
+                                && conn.sni_buf[0] == 0x16
+                                && conn.sni_buf[1] == 0x03;
+                            if conn.dst_port == 443 || is_tls_handshake {
+                                let expected = conn.validated_domain.as_deref().unwrap_or("");
+                                let valid = match extract_tls_sni(&conn.sni_buf) {
+                                    Some(ref sni) => {
+                                        sni.eq_ignore_ascii_case(expected.trim_end_matches('.'))
+                                            && self
+                                                .policy
+                                                .check_domain(sni, Some(conn.dst_port))
+                                                .is_allowed()
+                                    }
+                                    None => false,
+                                };
+                                if !valid {
+                                    self.stats.sni_blocked += 1;
+                                    sock.abort();
+                                    to_remove.push(idx);
+                                    continue;
                                 }
-                                None => false,
-                            };
-                            if !valid {
-                                self.stats.sni_blocked += 1;
-                                sock.abort();
-                                to_remove.push(idx);
-                                continue;
                             }
                             conn.tx_pending.extend(conn.sni_buf.drain(..));
                         }
@@ -505,22 +524,27 @@ impl SlirpBridge {
                 }
             }
 
-            // 5. Host -> Guest relay
+            // 5. Host -> Guest relay: cap `up.read` to smoltcp's free TX capacity so
+            //    `sock.send_slice` NEVER drops partial bytes and corrupts TLS/TCP streams!
             if let UpstreamState::Connected(ref mut up) = conn.upstream
                 && sock.can_send()
             {
-                match up.read(&mut tmp) {
-                    Ok(0) => {
-                        sock.close();
-                        conn.upstream = UpstreamState::Idle;
-                    }
-                    Ok(n) => {
-                        let _ = sock.send_slice(&tmp[..n]);
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        sock.abort();
-                        conn.upstream = UpstreamState::Idle;
+                let free = sock.send_capacity().saturating_sub(sock.send_queue());
+                let max_read = free.min(tmp.len());
+                if max_read > 0 {
+                    match up.read(&mut tmp[..max_read]) {
+                        Ok(0) => {
+                            sock.close();
+                            conn.upstream = UpstreamState::Idle;
+                        }
+                        Ok(n) => {
+                            let _ = sock.send_slice(&tmp[..n]);
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            sock.abort();
+                            conn.upstream = UpstreamState::Idle;
+                        }
                     }
                 }
             }

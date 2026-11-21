@@ -224,10 +224,12 @@ pub(crate) fn child_main(
                 fail_child(err_tx, ChildStage::SetHostname, e.0);
             }
         }
+    }
 
-        // 4b. Drop all capabilities (bounding set + effective/permitted/inheritable)
-        //     acquired by uid=0 inside the user namespace.
-        drop_all_capabilities();
+    // 4b. Unconditionally drop all capabilities (ambient, bounding, effective/permitted/inheritable)
+    //     both inside user namespaces AND when invoked from a privileged host with `--no-ns`.
+    if let Err(e) = drop_all_capabilities() {
+        fail_child(err_tx, ChildStage::NoNewPrivs, e.0);
     }
 
     // 4c. Apply `setrlimit` + `PR_SET_DUMPABLE=0` defense-in-depth safety net:
@@ -398,26 +400,27 @@ fn mask_proc_entries(relative: bool) {
 
 /// Zero-allocation PID 1 subreaper loop inside `CLONE_NEWPID`.
 ///
-/// Reaps all orphaned zombie grandchildren and exits with PID 2's status once
-/// PID 2 terminates (or all children have exited).
+/// Reaps orphaned zombie grandchildren and exits immediately once PID 2
+/// terminates (the Linux kernel automatically `SIGKILL`s any remaining
+/// processes in the PID namespace when PID 1 exits).
 fn pid1_reap_loop(pid2: i32) -> ! {
-    let mut exit_code: i32 = 0;
     loop {
         match waitpid(None, WaitOptions::empty()) {
             Ok(Some((pid, status))) => {
                 if pid.as_raw_nonzero().get() == pid2 {
-                    if let Some(code) = status.exit_status() {
-                        exit_code = code;
+                    let exit_code = if let Some(code) = status.exit_status() {
+                        code
                     } else if let Some(sig) = status.terminating_signal() {
-                        exit_code = 128 + sig;
-                    }
-                    // Continue reaping any remaining orphans until ECHILD
+                        128 + sig
+                    } else {
+                        0
+                    };
+                    exit_group(exit_code);
                 }
             }
             Ok(None) => continue,
             Err(Errno::INTR) => continue,
-            Err(Errno::CHILD) => exit_group(exit_code),
-            Err(_) => exit_group(exit_code),
+            Err(_) => exit_group(0),
         }
     }
 }

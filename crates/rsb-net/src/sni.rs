@@ -66,6 +66,9 @@ pub fn extract_tls_sni(buf: &[u8]) -> Option<String> {
     pos += 2;
     let ext_end = (pos + ext_total).min(body.len());
 
+    let mut found_sni: Option<String> = None;
+    let mut saw_sni_ext = false;
+
     while pos + 4 <= ext_end {
         let ext_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
         let ext_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
@@ -73,7 +76,17 @@ pub fn extract_tls_sni(buf: &[u8]) -> Option<String> {
         if pos + ext_len > ext_end {
             return None;
         }
+        // Reject Encrypted Client Hello (ECH, 0xfe0d) so an outer cover domain
+        // cannot smuggle a blocked inner target domain on shared CDNs.
+        if ext_type == 0xfe0d {
+            return None;
+        }
         if ext_type == 0x0000 {
+            if saw_sni_ext {
+                // RFC 8446 §4.2 forbids duplicate extensions (prevents SNI smuggling)
+                return None;
+            }
+            saw_sni_ext = true;
             // server_name extension:
             // [list_len: 2][name_type: 1][name_len: 2][name_bytes...]
             let ext_data = &body[pos..pos + ext_len];
@@ -81,7 +94,10 @@ pub fn extract_tls_sni(buf: &[u8]) -> Option<String> {
                 return None;
             }
             let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
-            let list_end = (2 + list_len).min(ext_data.len());
+            if 2 + list_len != ext_data.len() {
+                return None;
+            }
+            let list_end = 2 + list_len;
             let mut lpos = 2;
             while lpos + 3 <= list_end {
                 let name_type = ext_data[lpos];
@@ -91,9 +107,15 @@ pub fn extract_tls_sni(buf: &[u8]) -> Option<String> {
                     return None;
                 }
                 if name_type == 0x00 {
-                    return core::str::from_utf8(&ext_data[lpos..lpos + name_len])
-                        .ok()
-                        .map(|s| s.to_ascii_lowercase());
+                    if found_sni.is_some() || name_len == 0 {
+                        // Duplicate host_name entry or empty SNI -> reject
+                        return None;
+                    }
+                    let s = core::str::from_utf8(&ext_data[lpos..lpos + name_len]).ok()?;
+                    if !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.') {
+                        return None;
+                    }
+                    found_sni = Some(s.to_ascii_lowercase());
                 }
                 lpos += name_len;
             }
@@ -101,7 +123,7 @@ pub fn extract_tls_sni(buf: &[u8]) -> Option<String> {
         pos += ext_len;
     }
 
-    None
+    found_sni
 }
 
 #[cfg(test)]
