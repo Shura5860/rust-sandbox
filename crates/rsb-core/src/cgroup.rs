@@ -76,31 +76,42 @@ impl CgroupGuard {
         }
 
         let guard = Self { dir: leaf };
+        let mut applied_any = false;
 
-        // Apply configured limits. Ignore individual missing controller files unless strict.
-        if let Some(mem) = limits.memory_max_bytes
-            && let Err(e) = fs::write(guard.dir.join("memory.max"), format!("{mem}\n"))
-            && limits.strict_cgroup
-        {
-            return Err(e);
+        // Apply configured limits. Track whether at least one quota file actually succeeded
+        // so we never falsely report `cgroup_active = true` when the parent cgroup lacks
+        // delegated controllers (e.g. Cgroups v2 "no internal processes" rule).
+        if let Some(mem) = limits.memory_max_bytes {
+            match fs::write(guard.dir.join("memory.max"), format!("{mem}\n")) {
+                Ok(()) => applied_any = true,
+                Err(e) if limits.strict_cgroup => return Err(e),
+                Err(_) => {}
+            }
         }
 
-        if let Some(pids) = limits.pids_max
-            && let Err(e) = fs::write(guard.dir.join("pids.max"), format!("{pids}\n"))
-            && limits.strict_cgroup
-        {
-            return Err(e);
+        if let Some(pids) = limits.pids_max {
+            match fs::write(guard.dir.join("pids.max"), format!("{pids}\n")) {
+                Ok(()) => applied_any = true,
+                Err(e) if limits.strict_cgroup => return Err(e),
+                Err(_) => {}
+            }
         }
 
         if let Some(pct) = limits.cpu_quota_percent {
             // Standard 100ms (100_000us) CFS period
             let period_us: u64 = 100_000;
             let quota_us: u64 = (pct as u64).saturating_mul(1_000).max(1_000);
-            if let Err(e) = fs::write(guard.dir.join("cpu.max"), format!("{quota_us} {period_us}\n"))
-                && limits.strict_cgroup
-            {
-                return Err(e);
+            match fs::write(guard.dir.join("cpu.max"), format!("{quota_us} {period_us}\n")) {
+                Ok(()) => applied_any = true,
+                Err(e) if limits.strict_cgroup => return Err(e),
+                Err(_) => {}
             }
+        }
+
+        if !applied_any {
+            // Drop `guard` to remove the empty leaf directory and report cgroup inactive.
+            drop(guard);
+            return Ok(None);
         }
 
         Ok(Some(guard))

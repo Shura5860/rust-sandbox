@@ -51,6 +51,19 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 // Standard Linux errno values
 pub const EPERM: u16 = 1;
+const ENOSYS: u16 = 38;
+
+// Namespace creation flags disallowed in `clone(flags, ...)` inside the sandbox
+const CLONE_NS_FLAGS: u32 = 0x0002_0000 // CLONE_NEWNS
+    | 0x0200_0000 // CLONE_NEWCGROUP
+    | 0x0400_0000 // CLONE_NEWUTS
+    | 0x0800_0000 // CLONE_NEWIPC
+    | 0x1000_0000 // CLONE_NEWUSER
+    | 0x2000_0000 // CLONE_NEWPID
+    | 0x4000_0000; // CLONE_NEWNET
+
+// BPF_JSET opcode for bitmask testing in `clone(flags)`
+const BPF_JSET: u16 = 0x40;
 
 // Socket address families
 const AF_INET: u32 = 2;
@@ -67,6 +80,7 @@ const TIOCLINUX: u32 = 0x541C;
 pub mod nr {
     pub const IOCTL: u32 = 16;
     pub const SOCKET: u32 = 41;
+    pub const CLONE: u32 = 56;
     pub const EXECVE: u32 = 59;
     pub const EXIT: u32 = 60;
     pub const PTRACE: u32 = 101;
@@ -86,11 +100,13 @@ pub mod nr {
     pub const REQUEST_KEY: u32 = 249;
     pub const KEYCTL: u32 = 250;
     pub const UNSHARE: u32 = 272;
+    pub const VMSPLICE: u32 = 278;
     pub const PERF_EVENT_OPEN: u32 = 298;
     pub const OPEN_BY_HANDLE_AT: u32 = 304;
     pub const SETNS: u32 = 308;
     pub const PROCESS_VM_READV: u32 = 310;
     pub const PROCESS_VM_WRITEV: u32 = 311;
+    pub const KCMP: u32 = 312;
     pub const FINIT_MODULE: u32 = 313;
     pub const KEXEC_FILE_LOAD: u32 = 320;
     pub const BPF: u32 = 321;
@@ -98,15 +114,28 @@ pub mod nr {
     pub const IO_URING_SETUP: u32 = 425;
     pub const IO_URING_ENTER: u32 = 426;
     pub const IO_URING_REGISTER: u32 = 427;
+    pub const OPEN_TREE: u32 = 428;
+    pub const MOVE_MOUNT: u32 = 429;
+    pub const FSOPEN: u32 = 430;
+    pub const FSCONFIG: u32 = 431;
+    pub const FSMOUNT: u32 = 432;
+    pub const FSPICK: u32 = 433;
+    pub const CLONE3: u32 = 435;
+    pub const PIDFD_GETFD: u32 = 438;
+    pub const PROCESS_MADVISE: u32 = 440;
+    pub const MOUNT_SETATTR: u32 = 442;
+    pub const PROCESS_MRELEASE: u32 = 448;
 }
 
 #[cfg(target_arch = "aarch64")]
 pub mod nr {
     pub const IOCTL: u32 = 29;
     pub const SOCKET: u32 = 198;
+    pub const CLONE: u32 = 220;
     pub const EXECVE: u32 = 221;
     pub const EXIT: u32 = 93;
     pub const EXIT_GROUP: u32 = 94;
+    pub const VMSPLICE: u32 = 75;
     pub const PTRACE: u32 = 117;
     pub const PERSONALITY: u32 = 92;
     pub const CHROOT: u32 = 51;
@@ -128,6 +157,7 @@ pub mod nr {
     pub const SETNS: u32 = 268;
     pub const PROCESS_VM_READV: u32 = 270;
     pub const PROCESS_VM_WRITEV: u32 = 271;
+    pub const KCMP: u32 = 272;
     pub const FINIT_MODULE: u32 = 273;
     pub const KEXEC_FILE_LOAD: u32 = 294;
     pub const BPF: u32 = 280;
@@ -135,6 +165,17 @@ pub mod nr {
     pub const IO_URING_SETUP: u32 = 425;
     pub const IO_URING_ENTER: u32 = 426;
     pub const IO_URING_REGISTER: u32 = 427;
+    pub const OPEN_TREE: u32 = 428;
+    pub const MOVE_MOUNT: u32 = 429;
+    pub const FSOPEN: u32 = 430;
+    pub const FSCONFIG: u32 = 431;
+    pub const FSMOUNT: u32 = 432;
+    pub const FSPICK: u32 = 433;
+    pub const CLONE3: u32 = 435;
+    pub const PIDFD_GETFD: u32 = 438;
+    pub const PROCESS_MADVISE: u32 = 440;
+    pub const MOUNT_SETATTR: u32 = 442;
+    pub const PROCESS_MRELEASE: u32 = 448;
 }
 
 /// Action taken when a Seccomp rule matches.
@@ -303,11 +344,38 @@ impl SeccompPolicy {
                 nr::KEXEC_FILE_LOAD,
                 nr::BPF,
                 nr::USERFAULTFD,
+                nr::VMSPLICE,
+                nr::KCMP,
+                nr::OPEN_TREE,
+                nr::MOVE_MOUNT,
+                nr::FSOPEN,
+                nr::FSCONFIG,
+                nr::FSMOUNT,
+                nr::FSPICK,
+                nr::MOUNT_SETATTR,
+                nr::PIDFD_GETFD,
+                nr::PROCESS_MADVISE,
+                nr::PROCESS_MRELEASE,
             ];
             for &sys_nr in KILL_ON_CALL {
                 asm.jeq_k(sys_nr, 0, 1);
                 asm.ret_k(SECCOMP_RET_KILL_PROCESS);
             }
+
+            // Return ENOSYS for `clone3` (cBPF cannot dereference `clone_args` pointer;
+            // glibc/musl transparently fall back to `clone(2)`), and reject any `clone(2)`
+            // call requesting namespace creation (`CLONE_NEWUSER`, `CLONE_NEWNS`, etc.)
+            // so a sandboxed process cannot regain `CAP_SYS_ADMIN` in a nested userns.
+            let eperm_ret = SeccompAction::Errno(EPERM).to_bpf_ret();
+            let enosys_ret = SeccompAction::Errno(ENOSYS).to_bpf_ret();
+            asm.jeq_k(nr::CLONE3, 0, 1);
+            asm.ret_k(enosys_ret);
+
+            asm.jeq_k(nr::CLONE, 0, 4);
+            asm.ld_abs_w(OFFSET_ARG0_LO);
+            asm.jset_k(CLONE_NS_FLAGS, 0, 1);
+            asm.ret_k(eperm_ret);
+            asm.ld_abs_w(OFFSET_NR);
 
             // Block `io_uring_*` with EPERM (instead of SIGSYS) so modern runtimes like
             // Node.js / libuv cleanly fall back to `epoll` instead of crashing at startup.
@@ -316,7 +384,6 @@ impl SeccompPolicy {
                 nr::IO_URING_ENTER,
                 nr::IO_URING_REGISTER,
             ];
-            let eperm_ret = SeccompAction::Errno(EPERM).to_bpf_ret();
             for &sys_nr in DENY_EPERM {
                 asm.jeq_k(sys_nr, 0, 1);
                 asm.ret_k(eperm_ret);
@@ -362,6 +429,16 @@ impl BpfAssembler {
     fn jeq_k(&mut self, k: u32, jt: u8, jf: u8) {
         self.insns.push(SockFilter {
             code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt,
+            jf,
+            k,
+        });
+    }
+
+    #[inline]
+    fn jset_k(&mut self, k: u32, jt: u8, jf: u8) {
+        self.insns.push(SockFilter {
+            code: BPF_JMP | BPF_JSET | BPF_K,
             jt,
             jf,
             k,

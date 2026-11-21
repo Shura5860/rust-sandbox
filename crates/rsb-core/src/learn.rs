@@ -148,10 +148,12 @@ where
         }
     }
 
+    const PTRACE_O_TRACEEXEC: usize = 0x0000_0010;
     let opts = PTRACE_O_TRACESYSGOOD
         | PTRACE_O_TRACEFORK
         | PTRACE_O_TRACEVFORK
         | PTRACE_O_TRACECLONE
+        | PTRACE_O_TRACEEXEC
         | PTRACE_O_EXITKILL;
     if let Err(errno) = ptrace::setoptions(root_pid, opts) {
         let _ = kill_process(root_pid_t, Signal::KILL);
@@ -176,8 +178,11 @@ where
     let mut network_used = false;
     let mut root_exit_code: Option<i32> = None;
 
-    // Track whether each traced TID is currently on syscall-entry vs syscall-exit
+    // Track whether each traced TID is currently on syscall-entry vs syscall-exit,
+    // and which TIDs have already passed their initial kernel `SIGSTOP` after fork/clone.
     let mut in_syscall: BTreeMap<i32, bool> = BTreeMap::new();
+    let mut seen_tids: BTreeSet<i32> = BTreeSet::new();
+    seen_tids.insert(root_pid);
 
     // Linux `__WALL` (0x4000_0000): wait for both cloned threads and forked children
     // strictly inside this tracee's process group (`waitpgid(root_pid_t, __WALL)`).
@@ -201,6 +206,7 @@ where
 
         if status.exited() || status.signaled() {
             in_syscall.remove(&tid);
+            seen_tids.remove(&tid);
             if tid == root_pid {
                 root_exit_code = status.exit_status();
             }
@@ -208,8 +214,10 @@ where
         }
 
         if let Some(sig) = status.stopping_signal() {
+            let ptrace_event = (status.as_raw() >> 16) & 0xff;
             // `SIGTRAP | 0x80` (133) indicates a syscall-entry or syscall-exit stop
             if sig == (5 | 0x80) {
+                seen_tids.insert(tid);
                 let entering = !in_syscall.get(&tid).copied().unwrap_or(false);
                 in_syscall.insert(tid, entering);
 
@@ -226,11 +234,22 @@ where
                     );
                 }
                 let _ = ptrace::syscall_continue(tid, 0);
-            } else if sig == 5 {
-                // ptrace event stop (fork/vfork/clone/exec) — don't inject SIGTRAP
+            } else if sig == 19 && !seen_tids.contains(&tid) {
+                // Initial kernel `SIGSTOP` for a newly attached fork/vfork/clone child/thread:
+                // MUST NOT be re-injected or the new thread/child freezes permanently!
+                seen_tids.insert(tid);
+                let _ = ptrace::syscall_continue(tid, 0);
+            } else if sig == 5 && ptrace_event != 0 {
+                // Real ptrace event stop (FORK=1, VFORK=2, CLONE=3, EXEC=4, EXIT=6).
+                // On PTRACE_EVENT_EXEC (4), reset `in_syscall` so entry/exit cannot desync.
+                seen_tids.insert(tid);
+                if ptrace_event == 4 {
+                    in_syscall.insert(tid, false);
+                }
                 let _ = ptrace::syscall_continue(tid, 0);
             } else {
-                // Deliver normal signal to tracee
+                // Deliver normal signal (including genuine user SIGTRAP when ptrace_event == 0)
+                seen_tids.insert(tid);
                 let _ = ptrace::syscall_continue(tid, sig);
             }
         } else {

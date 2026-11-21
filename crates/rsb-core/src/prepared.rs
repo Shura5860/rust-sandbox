@@ -59,6 +59,17 @@ unsafe impl Sync for PreparedSandbox {}
 impl PreparedSandbox {
     /// Compile a declarative `SandboxPolicy` into a `PreparedSandbox`.
     pub fn from_policy(policy: SandboxPolicy) -> Result<Self, SandboxError> {
+        if !policy.ephemeral_cow.is_empty() && !policy.namespaces.enabled {
+            return Err(SandboxError::InvalidPolicy(
+                "ephemeral_cow (--cow) requires namespaces(true); refusing to write directly to host directory".into(),
+            ));
+        }
+        if policy.rootfs.is_some() && !policy.namespaces.enabled {
+            return Err(SandboxError::InvalidPolicy(
+                "rootfs (--rootfs) requires namespaces(true) for pivot_root".into(),
+            ));
+        }
+
         let resolved_program =
             resolve_executable(&policy.program, policy.rootfs.as_deref())?;
         let program_cstr = os_to_cstring(resolved_program.as_os_str())?;

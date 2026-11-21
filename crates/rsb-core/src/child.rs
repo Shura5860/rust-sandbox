@@ -135,8 +135,38 @@ pub(crate) fn child_main(
             }
         }
 
-        // 3c. Optional dedicated rootfs via `pivot_root(".", ".")` + `umount2(".", MNT_DETACH)`
-        //     and masked `/proc` (`/proc/sys`, `/proc/irq`, `/proc/bus`, `/proc/kcore`).
+        // 3c. Optional rootless TAP setup inside `CLONE_NEWNET` BEFORE `pivot_root` and
+        //     BEFORE dropping capabilities: opens host `/dev/net/tun` (`tap0`), configures
+        //     `10.0.2.15/24` + gw `10.0.2.2`, passes `tap_fd` to host `SlirpBridge` via
+        //     `SCM_RIGHTS`, and closes child's `tap_fd` immediately.
+        if let Some(sock_fd) = tap_sock {
+            let (tap_fd, ifname) = match open_tap_raw(b"tap0") {
+                Ok(pair) => pair,
+                Err(e) => fail_child(err_tx, ChildStage::TapSetup, e.0),
+            };
+            if let Err(e) = configure_tap_ipv4_raw(
+                &ifname,
+                Ipv4Addr::new(10, 0, 2, 15),
+                Ipv4Addr::new(255, 255, 255, 0),
+                Ipv4Addr::new(10, 0, 2, 2),
+            ) {
+                fail_child(err_tx, ChildStage::TapSetup, e.0);
+            }
+            if prepared.rootfs.is_none()
+                && let Some(resolv_src) = resolv_tmp
+            {
+                let _ = mount_bind(resolv_src, c"/etc/resolv.conf");
+            }
+            if let Err(e) = send_fd(sock_fd, tap_fd.as_raw_fd()) {
+                fail_child(err_tx, ChildStage::TapSetup, e.0);
+            }
+            // Drop `tap_fd` immediately so untrusted code cannot touch raw L2 frames
+            drop(tap_fd);
+        }
+
+        // 3d. Mount fresh `/proc` inside `CLONE_NEWPID` and mask sensitive `/proc` kernel
+        //     interfaces. When `rootfs` is set, also bind-mount `resolv_tmp` into the
+        //     rootfs BEFORE `pivot_root` detaches the host filesystem.
         if let Some(ref rootfs) = prepared.rootfs {
             if let Err(e) = mount_bind_recursive(rootfs.as_c_str(), rootfs.as_c_str()) {
                 fail_child(err_tx, ChildStage::PivotRoot, e.raw_os_error());
@@ -144,31 +174,17 @@ pub(crate) fn child_main(
             if let Err(e) = chdir(rootfs.as_c_str()) {
                 fail_child(err_tx, ChildStage::PivotRoot, e.raw_os_error());
             }
-            // Mount fresh procfs inside new PID namespace if `./proc` exists in rootfs
-            let _ = mount(c"proc", c"./proc", c"proc", MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV, c"");
-            // Mask sensitive `/proc` kernel interfaces (best-effort if present)
+            if let Some(resolv_src) = resolv_tmp {
+                let _ = mount_bind(resolv_src, c"./etc/resolv.conf");
+            }
             let _ = mount(
-                c"tmpfs",
-                c"./proc/sys",
-                c"tmpfs",
-                MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV,
-                c"size=0,mode=0555",
+                c"proc",
+                c"./proc",
+                c"proc",
+                MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV,
+                c"",
             );
-            let _ = mount(
-                c"tmpfs",
-                c"./proc/irq",
-                c"tmpfs",
-                MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV,
-                c"size=0,mode=0555",
-            );
-            let _ = mount(
-                c"tmpfs",
-                c"./proc/bus",
-                c"tmpfs",
-                MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV,
-                c"size=0,mode=0555",
-            );
-            let _ = mount_bind(c"/dev/null", c"./proc/kcore");
+            mask_proc_entries(true);
 
             let dot = c".";
             let ret = unsafe {
@@ -187,6 +203,17 @@ pub(crate) fn child_main(
             if let Err(e) = chdir(c"/") {
                 fail_child(err_tx, ChildStage::PivotRoot, e.raw_os_error());
             }
+        } else {
+            // Default mode (host rootfs): mount a fresh procfs for our PID namespace
+            // and mask sensitive `/proc` subpaths so host PIDs and kernel knobs are hidden.
+            let _ = mount(
+                c"proc",
+                c"/proc",
+                c"proc",
+                MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV,
+                c"",
+            );
+            mask_proc_entries(false);
         }
 
         // 4. Set isolated UTS hostname if configured.
@@ -196,33 +223,6 @@ pub(crate) fn child_main(
             if let Err(e) = rsb_sys::RawErrno::from_raw_ret(ret) {
                 fail_child(err_tx, ChildStage::SetHostname, e.0);
             }
-        }
-
-        // 4a. Optional rootless TAP setup inside `CLONE_NEWNET` BEFORE dropping capabilities:
-        //     opens `/dev/net/tun` (`tap0`), configures `10.0.2.15/24` + gw `10.0.2.2`,
-        //     bind-mounts `/etc/resolv.conf` -> `nameserver 10.0.2.2`, passes `tap_fd`
-        //     to host `SlirpBridge` via `SCM_RIGHTS`, and closes child's `tap_fd`.
-        if let Some(sock_fd) = tap_sock {
-            let (tap_fd, ifname) = match open_tap_raw(b"tap0") {
-                Ok(pair) => pair,
-                Err(e) => fail_child(err_tx, ChildStage::TapSetup, e.0),
-            };
-            if let Err(e) = configure_tap_ipv4_raw(
-                &ifname,
-                Ipv4Addr::new(10, 0, 2, 15),
-                Ipv4Addr::new(255, 255, 255, 0),
-                Ipv4Addr::new(10, 0, 2, 2),
-            ) {
-                fail_child(err_tx, ChildStage::TapSetup, e.0);
-            }
-            if let Some(resolv_src) = resolv_tmp {
-                let _ = mount_bind(resolv_src, c"/etc/resolv.conf");
-            }
-            if let Err(e) = send_fd(sock_fd, tap_fd.as_raw_fd()) {
-                fail_child(err_tx, ChildStage::TapSetup, e.0);
-            }
-            // Drop `tap_fd` immediately so untrusted code cannot touch raw L2 frames
-            drop(tap_fd);
         }
 
         // 4b. Drop all capabilities (bounding set + effective/permitted/inheritable)
@@ -337,6 +337,63 @@ pub(crate) fn child_main(
         )
     };
     fail_child(err_tx, ChildStage::Execve, err.0);
+}
+
+/// Zero-allocation OCI-style `/proc` masking inside `CLONE_NEWNS`.
+///
+/// Masks sensitive kernel directories with an empty read-only `tmpfs` and
+/// sensitive files with `/dev/null` bind mounts (best-effort for paths that
+/// may not exist on a given kernel or minimal rootfs).
+fn mask_proc_entries(relative: bool) {
+    let dirs: &[&core::ffi::CStr] = if relative {
+        &[
+            c"./proc/sys",
+            c"./proc/irq",
+            c"./proc/bus",
+            c"./proc/fs",
+            c"./proc/acpi",
+            c"./proc/scsi",
+            c"./proc/asound",
+        ]
+    } else {
+        &[
+            c"/proc/sys",
+            c"/proc/irq",
+            c"/proc/bus",
+            c"/proc/fs",
+            c"/proc/acpi",
+            c"/proc/scsi",
+            c"/proc/asound",
+        ]
+    };
+    let files: &[&core::ffi::CStr] = if relative {
+        &[
+            c"./proc/kcore",
+            c"./proc/keys",
+            c"./proc/timer_list",
+            c"./proc/sched_debug",
+            c"./proc/sysrq-trigger",
+            c"./proc/kallsyms",
+            c"./proc/latency_stats",
+        ]
+    } else {
+        &[
+            c"/proc/kcore",
+            c"/proc/keys",
+            c"/proc/timer_list",
+            c"/proc/sched_debug",
+            c"/proc/sysrq-trigger",
+            c"/proc/kallsyms",
+            c"/proc/latency_stats",
+        ]
+    };
+    let ro_tmpfs = MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV;
+    for &d in dirs {
+        let _ = mount(c"tmpfs", d, c"tmpfs", ro_tmpfs, c"size=0,mode=0555");
+    }
+    for &f in files {
+        let _ = mount_bind(c"/dev/null", f);
+    }
 }
 
 /// Zero-allocation PID 1 subreaper loop inside `CLONE_NEWPID`.

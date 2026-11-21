@@ -338,11 +338,20 @@ fn build_sandbox(
         None
     };
 
-    // Either attach transparent L2/L3 `SlirpBridge` over rootless `tap0` (`--transparent-tap`)
-    // OR start host-side HTTP/HTTPS CONNECT `EgressProxy`.
-    let (egress_proxy, tap_policy) = if use_transparent_tap {
+    // Either attach kernel-enforced transparent L2/L3 `SlirpBridge` over rootless `tap0`
+    // (default whenever namespaces are enabled and `--allow-domain`/`--allow-cidr` are set),
+    // OR fall back to advisory HTTP/HTTPS CONNECT `EgressProxy` only when `--no-ns` is requested.
+    let effective_tap =
+        use_transparent_tap || (egress_policy.is_some() && profile.namespaces);
+    let (egress_proxy, tap_policy) = if effective_tap {
+        if !profile.namespaces {
+            return Err("--transparent-tap requires namespaces (remove --no-ns)".into());
+        }
         (None, egress_policy)
     } else if let Some(epol) = egress_policy {
+        eprintln!(
+            "rsb: warning: --allow-domain/--allow-cidr with --no-ns uses advisory HTTP_PROXY only; direct sockets are NOT blocked without namespaces"
+        );
         let proxy = EgressProxy::start(epol)
             .map_err(|e| format!("failed to start egress filter proxy: {e}"))?;
         profile.allow_network = true;

@@ -350,9 +350,8 @@ impl SlirpBridge {
                     if let Ok(addrs) = (q.qname.as_str(), 0u16).to_socket_addrs() {
                         for sa in addrs {
                             if let IpAddr::V4(v4) = sa.ip()
-                                && policy
-                                    .check_ip(IpAddr::V4(v4), 443, Some(&q.qname))
-                                    .is_allowed()
+                                && (!policy.block_private_ips
+                                    || !crate::policy::is_private_or_metadata(IpAddr::V4(v4)))
                             {
                                 allowed_v4.push(v4);
                             }

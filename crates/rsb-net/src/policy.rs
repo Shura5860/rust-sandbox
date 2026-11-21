@@ -268,8 +268,8 @@ impl EgressPolicy {
         if self.block_private_ips && is_private_or_metadata(ip) {
             return EgressDecision::Deny("private/loopback/metadata IP blocked (SSRF guard)");
         }
-        if validated_domain.is_some() {
-            return EgressDecision::Allow;
+        if let Some(domain) = validated_domain {
+            return self.check_domain(domain, Some(port));
         }
         if self.allow_cidrs.iter().any(|r| r.matches(ip, port)) {
             EgressDecision::Allow
@@ -375,11 +375,16 @@ mod tests {
     #[test]
     fn ssrf_blocks_metadata_loopback_and_ipv4_mapped_v6() {
         let pol = EgressPolicy::default()
+            .allow_domain("api.openai.com:443")
+            .unwrap()
             .allow_cidr("203.0.113.10/32:443")
             .unwrap();
 
         assert!(pol.check_ip("203.0.113.10".parse().unwrap(), 443, None).is_allowed());
         assert!(!pol.check_ip("203.0.113.10".parse().unwrap(), 80, None).is_allowed());
+        // DomainRule port restriction must be enforced even when domain was validated via DNS
+        assert!(pol.check_ip("1.1.1.1".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
+        assert!(!pol.check_ip("1.1.1.1".parse().unwrap(), 80, Some("api.openai.com")).is_allowed());
 
         // Even with a validated domain (DNS rebinding attack!), private/metadata IPs are blocked!
         assert!(!pol.check_ip("169.254.169.254".parse().unwrap(), 80, Some("api.openai.com")).is_allowed());

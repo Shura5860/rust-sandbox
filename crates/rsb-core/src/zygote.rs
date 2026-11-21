@@ -184,6 +184,11 @@ while True:
             pass
         os._exit(exit_code & 0xFF)
     else:
+        # Set worker's process group from parent as well to eliminate the pre-setpgrp race.
+        try:
+            os.setpgid(pid, pid)
+        except OSError:
+            pass
         os.close(out_w)
         os.close(err_w)
         os.set_blocking(out_r, False)
@@ -208,22 +213,43 @@ while True:
 
             if not waited and deadline is not None and time.monotonic() >= deadline:
                 timed_out = True
+                # Kill both the process group AND the direct worker PID independently
+                # so a pre-setpgrp race can never leave the worker alive.
                 try:
                     os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except OSError:
                     pass
-                except PermissionError:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
                 _, st = os.waitpid(pid, 0)
                 waited = True
                 exit_code = 128 + os.WTERMSIG(st) if os.WIFSIGNALED(st) else 124
+                # Bounded non-blocking drain of any buffered output, then close open FDs
+                # immediately so an escaped grandchild holding pipes cannot deadlock us.
+                for fd in list(open_fds):
+                    try:
+                        while True:
+                            chunk = os.read(fd, 8192)
+                            if not chunk:
+                                break
+                            if fd == out_r and len(out_buf) < 1048576:
+                                out_buf.extend(chunk)
+                            elif fd == err_r and len(err_buf) < 1048576:
+                                err_buf.extend(chunk)
+                    except OSError:
+                        pass
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                open_fds.clear()
+                break
 
             if open_fds:
                 rem = 0.005
-                if deadline is not None and not waited:
+                if deadline is not None:
                     rem = max(0.001, min(0.005, deadline - time.monotonic()))
                 rlist, _, _ = select.select(open_fds, [], [], rem)
                 for fd in rlist:
@@ -240,6 +266,16 @@ while True:
                     else:
                         if len(err_buf) < 1048576:
                             err_buf.extend(chunk)
+                # If worker already exited and deadline expired (e.g., grandchild holds pipes),
+                # close remaining FDs and break instead of hanging forever.
+                if waited and deadline is not None and time.monotonic() >= deadline:
+                    for fd in list(open_fds):
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                    open_fds.clear()
+                    break
             elif waited:
                 break
             else:

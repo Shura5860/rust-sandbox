@@ -73,6 +73,17 @@ where
     S: Into<OsString>,
     F: FnMut(&SeccompNotif) -> UnotifyDecision,
 {
+    #[cfg(target_arch = "x86_64")]
+    const SYS_SENDMSG: u32 = 46;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_SENDMSG: u32 = 211;
+
+    if trapped_syscalls.contains(&SYS_SENDMSG) {
+        return Err(SandboxError::InvalidPolicy(
+            "cannot trap SYS_sendmsg in run_supervised (required to send seccomp_unotify listener FD via SCM_RIGHTS)".into(),
+        ));
+    }
+
     let mut sp = SeccompPolicy {
         enabled: true,
         block_dangerous_syscalls: false,
