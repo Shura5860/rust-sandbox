@@ -9,11 +9,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-authors = ["rust-sandbox contributors"]
+authors = ["Shura5860"]
+repository = "https://github.com/Shura5860/rust-sandbox"
 
 [workspace.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "thread", "mount", "pipe", "param", "stdio", "event"] }
