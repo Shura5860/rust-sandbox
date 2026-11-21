@@ -1,6 +1,34 @@
+<div align="center">
+
 # `rust-sandbox` (`rsb`)
 
-[English](#english) | [Türkçe](#türkçe)
+**Rootless Linux process isolation engine, CLI, and C/Python FFI library in pure Rust**
+
+*Namespaces · Landlock LSM · Seccomp-BPF · Cgroups v2 · OverlayFS CoW · `smoltcp` TAP Egress Filter*
+
+<p>
+  <a href="https://github.com/Shura5860/rust-sandbox/actions/workflows/ci.yml">
+    <img src="https://github.com/Shura5860/rust-sandbox/actions/workflows/ci.yml/badge.svg" alt="CI Status" />
+  </a>
+  <a href="https://github.com/Shura5860/rust-sandbox/releases">
+    <img src="https://img.shields.io/github/v/release/Shura5860/rust-sandbox?style=flat-square&color=d97706" alt="Latest Release" />
+  </a>
+  <img src="https://img.shields.io/badge/Rust-1.88%2B-dea584?style=flat-square&logo=rust" alt="Rust 1.88+" />
+  <img src="https://img.shields.io/badge/Platform-Linux-222222?style=flat-square&logo=linux" alt="Linux" />
+  <a href="LICENSE-MIT">
+    <img src="https://img.shields.io/badge/License-MIT%20%2F%20Apache--2.0-2563eb?style=flat-square" alt="License" />
+  </a>
+</p>
+
+<p>
+  <a href="#english">English</a> ·
+  <a href="#türkçe">Türkçe</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="ARCHITECTURE.md">Architecture</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+</div>
 
 ---
 
