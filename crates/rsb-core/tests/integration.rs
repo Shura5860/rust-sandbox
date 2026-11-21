@@ -2,8 +2,8 @@
 //! `rsb learn`, `sandbox.toml` profiles, and Rootless Namespaces).
 
 use rsb_core::{
-    NodeZygoteConfig, Sandbox, SandboxError, SandboxProfile, UnotifyDecision, ZygoteConfig,
-    ZygotePool, landlock_abi_version, run_supervised,
+    ChildStage, NodeZygoteConfig, Sandbox, SandboxError, SandboxProfile, UnotifyDecision,
+    ZygoteConfig, ZygotePool, landlock_abi_version, run_supervised,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -420,6 +420,15 @@ fn full_rootless_namespaces_and_landlock() {
         {
             eprintln!(
                 "skipping full namespace assertion: outer environment blocks clone3(CLONE_NEWUSER) (errno={})",
+                errno.0
+            );
+        }
+        Err(SandboxError::ChildSetupFailed {
+            stage: ChildStage::MountPrivate,
+            errno,
+        }) if matches!(errno.0, 1 | 13) => {
+            eprintln!(
+                "skipping full namespace assertion: host AppArmor restricts unprivileged userns mount capabilities (errno={})",
                 errno.0
             );
         }
