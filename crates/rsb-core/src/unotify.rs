@@ -28,6 +28,15 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnotifyDecision {
     /// Allow the kernel to execute the intercepted syscall normally.
+    ///
+    /// # Security Warning (TOCTOU)
+    /// Do **not** use `Continue` as a security boundary after inspecting pointer
+    /// arguments (such as file paths or `sockaddr` buffers) in the child's memory.
+    /// Another thread in the target process can race and mutate that memory between
+    /// inspection and kernel execution; `SECCOMP_IOCTL_NOTIF_ID_VALID` only confirms
+    /// that the notification ID is still live, not that user memory is unchanged.
+    /// For security-critical checks on pointer arguments, deny with [`Self::Errno`]
+    /// or perform the operation in the supervisor and return [`Self::ReturnValue`].
     Continue,
     /// Fail the syscall immediately with the given positive Linux errno (e.g. `1` = `EPERM`).
     Errno(i32),
@@ -48,6 +57,11 @@ pub struct SupervisedReport {
 /// Every time the child invokes a syscall in `trapped_syscalls`, `handler` is called
 /// on the host with the full [`SeccompNotif`] (`pid`, `nr`, `args[0..6]`) and returns
 /// a [`UnotifyDecision`].
+///
+/// # Isolation Note
+/// This helper installs only the `seccomp_unotify` filter (`namespaces(false)`,
+/// `landlock(false)`) and does **not** provide filesystem, namespace, or network
+/// isolation on its own. Combine with namespaces and Landlock when running untrusted code.
 pub fn run_supervised<I, S, F>(
     program: impl Into<PathBuf>,
     args: I,

@@ -267,6 +267,15 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
         };
         upstream.write_all(&first_buf)?;
 
+        // Handshake and SNI validation are complete; switch from the 10s handshake
+        // timeout to a 5-minute tunnel idle timeout so long downloads/streams do not
+        // prematurely half-close while idle connections still time out cleanly.
+        let tunnel_idle = Some(Duration::from_secs(300));
+        let _ = client.set_read_timeout(tunnel_idle);
+        let _ = client.set_write_timeout(tunnel_idle);
+        let _ = upstream.set_read_timeout(tunnel_idle);
+        let _ = upstream.set_write_timeout(tunnel_idle);
+
         let mut c_read = reader;
         let mut c_write = client;
         let mut u_read = upstream.try_clone()?;

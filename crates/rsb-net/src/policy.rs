@@ -204,7 +204,12 @@ impl fmt::Display for EgressDecision {
 pub struct EgressPolicy {
     pub allow_domains: Vec<DomainRule>,
     pub allow_cidrs: Vec<CidrRule>,
-    /// Block loopback, link-local / cloud metadata (`169.254.169.254`), and RFC1918 LANs.
+    /// Block loopback, link-local / cloud metadata (`169.254.169.254`), RFC1918 LANs,
+    /// and IPv6 transition/embedded-IPv4 encodings (IPv4-mapped, NAT64, 6to4, Teredo).
+    ///
+    /// When `true` (the default), this check is fail-closed and **takes precedence over
+    /// both `allow_domains` and `allow_cidrs`**. Set `.block_private_ips(false)` explicitly
+    /// if you intend to allow traffic to a private or loopback CIDR.
     pub block_private_ips: bool,
     /// Require TLS SNI to match the requested domain on port 443.
     pub verify_tls_sni: bool,
@@ -275,8 +280,10 @@ impl EgressPolicy {
 }
 
 /// Returns `true` for loopback, cloud metadata (`169.254.0.0/16`), RFC1918 private LANs,
-/// CGNAT (`100.64.0.0/10`), unspecified (`0.0.0.0/8`), IPv6 ULA/link-local, and
-/// IPv4-mapped IPv6 addresses pointing to any of the above.
+/// CGNAT (`100.64.0.0/10`), unspecified (`0.0.0.0/8`), IPv6 ULA/link-local/site-local,
+/// and IPv6 transition encodings that embed private IPv4 addresses (IPv4-mapped `::ffff:0:0/96`,
+/// IPv4-compatible `::/96`, NAT64 `64:ff9b::/96` & `64:ff9b:1::/48`, 6to4 `2002::/16`,
+/// and Teredo `2001::/32`).
 pub fn is_private_or_metadata(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_private_v4(v4),
@@ -284,13 +291,53 @@ pub fn is_private_or_metadata(ip: IpAddr) -> bool {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return is_private_v4(mapped);
             }
+            let seg = v6.segments();
+            // Deprecated IPv4-compatible IPv6 (::a.b.c.d, excluding :: and ::1 handled below)
+            if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0
+                && (seg[6] != 0 || seg[7] > 1)
+            {
+                let embedded = Ipv4Addr::from(((seg[6] as u32) << 16) | (seg[7] as u32));
+                if is_private_v4(embedded) {
+                    return true;
+                }
+            }
+            // Well-known NAT64 prefix (64:ff9b::/96) embedding IPv4 in the last 32 bits
+            if seg[0] == 0x0064
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                let embedded = Ipv4Addr::from(((seg[6] as u32) << 16) | (seg[7] as u32));
+                if is_private_v4(embedded) {
+                    return true;
+                }
+            }
+            // Local-use NAT64 prefix (64:ff9b:1::/48, RFC 8215)
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
+                return true;
+            }
+            // 6to4 (2002::/16) embedding IPv4 in bits 16..48
+            if seg[0] == 0x2002 {
+                let embedded = Ipv4Addr::from(((seg[1] as u32) << 16) | (seg[2] as u32));
+                if is_private_v4(embedded) {
+                    return true;
+                }
+            }
+            // Teredo tunneling (2001:0000::/32) — block conservatively as NAT-traversal tunnel
+            if seg[0] == 0x2001 && seg[1] == 0x0000 {
+                return true;
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 // Unique Local Address (fc00::/7)
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xfe00) == 0xfc00
                 // Link-local (fe80::/10)
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xffc0) == 0xfe80
+                // Deprecated site-local (fec0::/10)
+                || (seg[0] & 0xffc0) == 0xfec0
         }
     }
 }
@@ -339,5 +386,15 @@ mod tests {
         assert!(!pol.check_ip("127.0.0.1".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
         assert!(!pol.check_ip("10.0.0.5".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
         assert!(!pol.check_ip("::ffff:169.254.169.254".parse().unwrap(), 80, Some("api.openai.com")).is_allowed());
+        // NAT64 (64:ff9b::/96 & 64:ff9b:1::/48), 6to4 (2002::/16), Teredo (2001::/32), IPv4-compatible
+        assert!(!pol.check_ip("64:ff9b::169.254.169.254".parse().unwrap(), 80, Some("api.openai.com")).is_allowed());
+        assert!(!pol.check_ip("64:ff9b:1::1".parse().unwrap(), 80, Some("api.openai.com")).is_allowed());
+        assert!(!pol.check_ip("2002:a9fe:a9fe::1".parse().unwrap(), 80, Some("api.openai.com")).is_allowed());
+        assert!(!pol.check_ip("2002:7f00:0001::1".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
+        assert!(!pol.check_ip("2001::1".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
+        assert!(!pol.check_ip("::127.0.0.1".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
+        // Public NAT64 / 6to4 destinations remain allowed when domain is validated
+        assert!(pol.check_ip("64:ff9b::1.1.1.1".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
+        assert!(pol.check_ip("2002:0101:0101::1".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
     }
 }

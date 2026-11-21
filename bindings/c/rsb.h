@@ -32,7 +32,15 @@ char *rsb_exec_json(
 /* Free a string returned by `rsb_exec_json` or `rsb_zygote_exec_json`. */
 void rsb_string_free(char *ptr);
 
-/* Opaque handle for a pre-warmed Python Zygote fork server. */
+/*
+ * Opaque handle for a pre-warmed Python Zygote fork server.
+ *
+ * Thread safety: `rsb_zygote_pool_t` is NOT thread-safe. Callers must serialize
+ * concurrent calls to `rsb_zygote_exec_json` and `rsb_zygote_free` on the same
+ * handle (e.g. with a mutex). Separate handles may be used concurrently from
+ * different threads. `rsb_version`, `rsb_landlock_abi`, `rsb_exec_json`, and
+ * `rsb_string_free` are thread-safe.
+ */
 typedef struct rsb_zygote_pool rsb_zygote_pool_t;
 
 rsb_zygote_pool_t *rsb_zygote_start_python(int32_t allow_network, int32_t use_namespaces);
