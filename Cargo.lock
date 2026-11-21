@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "rsb-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rsb-core",
  "rsb-net",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "rsb-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rsb-sys",
  "rustix",
@@ -149,14 +149,14 @@ dependencies = [
 
 [[package]]
 name = "rsb-ffi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rsb-core",
 ]
 
 [[package]]
 name = "rsb-net"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rsb-sys",
  "smoltcp",
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "rsb-sys"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rustix",
 ]
