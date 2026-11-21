@@ -1,0 +1,9 @@
+[package]
+name = "rsb-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-C-dependency Linux syscall wrappers (rustix linux_raw + raw clone3/Landlock/seccomp)"
+
+[dependencies]
+rustix.workspace = true

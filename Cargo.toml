@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsb-sys",
+    "crates/rsb-core",
+    "crates/rsb-net",
+    "crates/rsb-ffi",
+    "crates/rsb-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["rust-sandbox contributors"]
+
+[workspace.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "thread", "mount", "pipe", "param", "stdio", "event"] }
+rsb-sys = { path = "crates/rsb-sys" }
+rsb-core = { path = "crates/rsb-core" }
+rsb-net = { path = "crates/rsb-net" }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }

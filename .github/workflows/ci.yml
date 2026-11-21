@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  linux-check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy (strict)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run unit, integration, fuzz, and escape tests
+        run: cargo test --workspace
+
+      - name: Build release artifacts (CLI + librsb_ffi.so)
+        run: cargo build --workspace --release
+
+      - name: Verify CLI info & Python ctypes FFI binding
+        run: |
+          ./target/release/rsb info
+          python3 bindings/python/rsb.py

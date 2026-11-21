@@ -1,0 +1,10 @@
+[package]
+name = "rsb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embeddable, zero-C-dependency Linux sandbox engine (Namespaces + Landlock + Seccomp)"
+
+[dependencies]
+rsb-sys.workspace = true
+rustix.workspace = true

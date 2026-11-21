@@ -1,0 +1,13 @@
+[package]
+name = "rsb-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI (`librsb_ffi.so`) and Python ctypes bridge for rust-sandbox"
+
+[lib]
+name = "rsb_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rsb-core.workspace = true

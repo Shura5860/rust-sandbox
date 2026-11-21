@@ -1,0 +1,14 @@
+[package]
+name = "rsb-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-C-dependency L3/L4/L7 egress filter, TLS SNI verifier, DNS filter, and smoltcp rootless TAP bridge for rust-sandbox"
+
+[features]
+default = ["smoltcp-bridge"]
+smoltcp-bridge = ["dep:smoltcp"]
+
+[dependencies]
+rsb-sys.workspace = true
+smoltcp = { workspace = true, optional = true }
