@@ -28,7 +28,7 @@ USAGE:
   rsb info
   rsb run [OPTIONS] -- <COMMAND> [ARGS...]
   rsb ai-exec [OPTIONS] -- <COMMAND> [ARGS...]
-  rsb learn [--strict] [--out <PATH>] -- <COMMAND> [ARGS...]
+  rsb learn [--strict] [--merge] [--out <PATH>] -- <COMMAND> [ARGS...]
   rsb zygote-bench [--no-ns] [--iters <N>]
 
 OPTIONS (rsb run / rsb ai-exec):
@@ -526,6 +526,7 @@ fn cmd_ai_exec(args: &[String]) -> ExitCode {
 fn cmd_learn(args: &[String]) -> ExitCode {
     let mut out_path: Option<PathBuf> = None;
     let mut strict_allowlist = false;
+    let mut merge = false;
     let mut i = 0;
     let mut cmd_start: Option<usize> = None;
 
@@ -540,6 +541,7 @@ fn cmd_learn(args: &[String]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--strict" => strict_allowlist = true,
+            "--merge" => merge = true,
             "--out" | "-o" => {
                 i += 1;
                 let Some(p) = args.get(i) else {
@@ -560,9 +562,14 @@ fn cmd_learn(args: &[String]) -> ExitCode {
         i += 1;
     }
 
+    if merge && out_path.is_none() {
+        eprintln!("rsb learn: --merge requires --out <PATH>");
+        return ExitCode::from(2);
+    }
+
     let Some(start) = cmd_start else {
         eprintln!(
-            "rsb learn: missing command (use `rsb learn [--strict] [--out sandbox.toml] -- <CMD>`)"
+            "rsb learn: missing command (use `rsb learn [--strict] [--merge] [--out sandbox.toml] -- <CMD>`)"
         );
         return ExitCode::from(2);
     };
@@ -582,13 +589,34 @@ fn cmd_learn(args: &[String]) -> ExitCode {
                 report.network_used,
                 if strict_allowlist { "allowlist" } else { "denylist" }
             );
-            let toml = report.profile.to_toml();
+            let final_profile = if merge
+                && let Some(ref path) = out_path
+                && path.exists()
+            {
+                let mut existing = match SandboxProfile::from_file(path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("rsb learn: failed to load existing {} for --merge: {e}", path.display());
+                        return ExitCode::from(1);
+                    }
+                };
+                existing.merge(&report.profile);
+                existing
+            } else {
+                report.profile
+            };
+
+            let toml = final_profile.to_toml();
             if let Some(path) = out_path {
                 if let Err(e) = std::fs::write(&path, &toml) {
                     eprintln!("rsb learn: failed to write {}: {e}", path.display());
                     return ExitCode::from(1);
                 }
-                eprintln!("[rsb learn] wrote profile to {}", path.display());
+                if merge {
+                    eprintln!("[rsb learn] merged profile into {}", path.display());
+                } else {
+                    eprintln!("[rsb learn] wrote profile to {}", path.display());
+                }
             } else {
                 print!("{toml}");
             }

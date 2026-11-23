@@ -271,6 +271,44 @@ impl SandboxProfile {
         out
     }
 
+    /// Merge another `SandboxProfile` into `self` by taking the union of observed
+    /// filesystem paths, network allowlists, and `allow_syscalls`.
+    ///
+    /// Useful with `rsb learn --merge` to combine multiple runs (e.g. happy path +
+    /// failure path + test suite) into a single `sandbox.toml` profile.
+    pub fn merge(&mut self, other: &SandboxProfile) {
+        self.allow_network |= other.allow_network;
+        self.transparent_tap |= other.transparent_tap;
+
+        fn union_sorted<T: Ord + Clone>(dst: &mut Vec<T>, src: &[T]) {
+            dst.extend(src.iter().cloned());
+            dst.sort();
+            dst.dedup();
+        }
+
+        union_sorted(&mut self.rw, &other.rw);
+        union_sorted(&mut self.ro, &other.ro);
+        union_sorted(&mut self.ro_data, &other.ro_data);
+        union_sorted(&mut self.ephemeral_cow, &other.ephemeral_cow);
+        union_sorted(&mut self.allow_domains, &other.allow_domains);
+        union_sorted(&mut self.allow_cidrs, &other.allow_cidrs);
+
+        // Paths promoted to `rw` do not need to be duplicated in `ro` / `ro_data`.
+        self.ro.retain(|p| !self.rw.contains(p));
+        self.ro_data.retain(|p| !self.rw.contains(p));
+
+        match (&mut self.allow_syscalls, &other.allow_syscalls) {
+            (Some(dst), Some(src)) => union_sorted(dst, src),
+            (None, Some(src)) => {
+                let mut v = src.clone();
+                v.sort_unstable();
+                v.dedup();
+                self.allow_syscalls = Some(v);
+            }
+            _ => {}
+        }
+    }
+
     /// Apply this profile's settings onto a `SandboxBuilder`.
     pub fn apply_to(&self, mut builder: SandboxBuilder) -> SandboxBuilder {
         builder = builder
@@ -541,6 +579,37 @@ mod tests {
         let toml = p.to_toml();
         let parsed = SandboxProfile::from_toml(&toml).expect("parse generated toml");
         assert_eq!(parsed, p);
+    }
+
+    #[test]
+    fn merge_profiles_unions_paths_and_syscalls() {
+        let mut base = SandboxProfile {
+            allow_network: false,
+            ro: vec![PathBuf::from("/etc/a"), PathBuf::from("/var/log/app")],
+            rw: vec![PathBuf::from("/tmp/out")],
+            allow_syscalls: Some(vec![1, 60]),
+            ..Default::default()
+        };
+        let extra = SandboxProfile {
+            allow_network: true,
+            ro: vec![PathBuf::from("/etc/b")],
+            rw: vec![PathBuf::from("/var/log/app"), PathBuf::from("/tmp/err")],
+            allow_syscalls: Some(vec![2, 60, 231]),
+            ..Default::default()
+        };
+
+        base.merge(&extra);
+        assert!(base.allow_network);
+        assert_eq!(base.ro, vec![PathBuf::from("/etc/a"), PathBuf::from("/etc/b")]);
+        assert_eq!(
+            base.rw,
+            vec![
+                PathBuf::from("/tmp/err"),
+                PathBuf::from("/tmp/out"),
+                PathBuf::from("/var/log/app"),
+            ]
+        );
+        assert_eq!(base.allow_syscalls, Some(vec![1, 2, 60, 231]));
     }
 
     #[test]
