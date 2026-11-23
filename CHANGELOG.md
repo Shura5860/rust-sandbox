@@ -2,6 +2,12 @@
 
 All notable changes to `rust-sandbox` (`rsb`) are documented in this file.
 
+## [0.1.3] - 2026-11-23
+
+### Added
+- `SandboxProfile::merge` and `rsb learn --merge --out <PATH>` to union filesystem paths, network allowlists, and `allow_syscalls` across multiple traced runs (e.g. happy path + failure path) into a single `sandbox.toml`.
+- Added `ARCHITECTURE.md` and `CHANGELOG.md`.
+
 ## [0.1.2] - 2026-11-21
 
 ### Fixed
