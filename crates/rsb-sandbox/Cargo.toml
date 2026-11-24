@@ -1,0 +1,22 @@
+[package]
+name = "rsb-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Rootless Linux process sandbox in pure Rust (Namespaces, Landlock, Seccomp-BPF, Cgroups v2, OverlayFS CoW, and network egress filtering)"
+
+[features]
+default = ["net"]
+net = ["dep:rsb-net"]
+
+[dependencies]
+rsb-sys.workspace = true
+rsb-core.workspace = true
+rsb-net = { workspace = true, optional = true }

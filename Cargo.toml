@@ -4,6 +4,7 @@ members = [
     "crates/rsb-sys",
     "crates/rsb-core",
     "crates/rsb-net",
+    "crates/rsb-sandbox",
     "crates/rsb-ffi",
     "crates/rsb-cli",
 ]

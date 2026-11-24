@@ -10,8 +10,11 @@
   <a href="https://github.com/Shura5860/rust-sandbox/actions/workflows/ci.yml">
     <img src="https://github.com/Shura5860/rust-sandbox/actions/workflows/ci.yml/badge.svg" alt="CI Status" />
   </a>
+  <a href="https://crates.io/crates/rsb-sandbox">
+    <img src="https://img.shields.io/crates/v/rsb-sandbox?style=flat-square&color=d97706" alt="crates.io" />
+  </a>
   <a href="https://github.com/Shura5860/rust-sandbox/releases">
-    <img src="https://img.shields.io/github/v/release/Shura5860/rust-sandbox?style=flat-square&color=d97706" alt="Latest Release" />
+    <img src="https://img.shields.io/github/v/release/Shura5860/rust-sandbox?style=flat-square&color=0ea5e9" alt="Latest Release" />
   </a>
   <img src="https://img.shields.io/badge/Rust-1.88%2B-dea584?style=flat-square&logo=rust" alt="Rust 1.88+" />
   <img src="https://img.shields.io/badge/Platform-Linux-222222?style=flat-square&logo=linux" alt="Linux" />
@@ -40,7 +43,11 @@
 ### Quick Start
 
 ```bash
-# Build the CLI (`rsb`) and shared FFI library (`librsb_ffi.so`)
+# As a Rust library or CLI from crates.io
+cargo add rsb-sandbox
+cargo install rsb-cli
+
+# Or build the CLI (`rsb`) and shared FFI library (`librsb_ffi.so`) from source
 cargo build --workspace --release
 
 # Inspect what the running kernel supports (Landlock ABI, userns, AppArmor, Cgroups v2)
@@ -97,6 +104,7 @@ bash benchmarks/bench.sh 20
 
 | Path | Description |
 |---|---|
+| `crates/rsb-sandbox` | Unified facade crate (`cargo add rsb-sandbox`) re-exporting `rsb-core`, `rsb-net`, and `rsb-sys`. |
 | `crates/rsb-sys` | Raw Linux syscall wrappers (`rustix` `linux_raw`, `clone3`, Landlock, `seccomp`, `ptrace`, `tap`, `unotify`). |
 | `crates/rsb-core` | Sandbox engine, `PreparedSandbox`, cBPF compiler, Cgroups v2, OverlayFS CoW, `sandbox.toml`, `learn`, `ZygotePool`. |
 | `crates/rsb-net` | Egress policy, SSRF guard, TLS SNI & DNS parsers, `EgressProxy`, and `smoltcp` `SlirpBridge`. |
@@ -127,7 +135,11 @@ cargo test --workspace
 ### Hızlı Başlangıç
 
 ```bash
-# CLI (`rsb`) ve paylaşımlı FFI kütüphanesini (`librsb_ffi.so`) derleyin
+# crates.io üzerinden Rust kütüphanesi veya CLI olarak kurulum
+cargo add rsb-sandbox
+cargo install rsb-cli
+
+# Veya kaynaktan CLI (`rsb`) ve paylaşımlı FFI kütüphanesini (`librsb_ffi.so`) derleyin
 cargo build --workspace --release
 
 # Çekirdeğin desteklediği özellikleri görün (Landlock ABI, userns, AppArmor, Cgroups v2)

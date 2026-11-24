@@ -163,6 +163,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsb-sandbox"
+version = "0.2.0"
+dependencies = [
+ "rsb-core",
+ "rsb-net",
+ "rsb-sys",
+]
+
+[[package]]
 name = "rsb-sys"
 version = "0.2.0"
 dependencies = [
