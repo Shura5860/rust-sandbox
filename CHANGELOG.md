@@ -2,6 +2,15 @@
 
 All notable changes to `rust-sandbox` (`rsb`) are documented in this file.
 
+## [0.2.0] - 2026-11-24
+
+### Added
+- **Kernel & Isolation Depth:** Landlock ABI v4+ TCP network (`BIND_TCP`/`CONNECT_TCP`) and ABI v6+ IPC scope (`ABSTRACT_UNIX_SOCKET`/`SIGNAL`), Cgroups v2 sibling-leaf delegation + `io.max` (block I/O quota), minimal `tmpfs` `/dev` in `rootfs` mode, `/sys/firmware` & `/sys/kernel` masking, `CLONE_NEWTIME`, OverlayFS `user.overlay.opaque` deletion detection, full `aarch64` `ptrace` (`PTRACE_GETREGSET`) & `rsb learn` parity, and `fuzz/` libFuzzer targets.
+- **Production `rsb-net`:** Bounded async DNS/TCP worker concurrency, multi-domain TTL/LRU CDN `dns_cache`, RFC 8446 multi-record TLS `ClientHello` reassembly, `UpstreamState::Closed`, deferred TCP `RST` flushing, idle connection eviction, TAP per-tick frame cap + `EAGAIN` retry queue, and optional `max_egress_bps` rate limiting.
+- **Policy Learning & TOML:** Exit-verified (`ret >= 0`) `rsb learn` syscall recording, `(deleted)` FD filtering, root/`$HOME` over-coalescing protection, multiline TOML arrays & single-quoted literal strings, and built-in `--preset` profiles (`python-ai`, `node-build`, `strict-offline`).
+- **AI Agent DX & Rich FFI:** Stateful `rsb session <start|exec|ls|stop>`, `rsb_exec_profile_toml_json` FFI API (+ Python `exec_with_profile_toml`), `ResourceLimits` on `ZygoteConfig`/`NodeZygoteConfig`, `--flag=value` CLI support, `--no-net` / `--no-transparent-tap` overrides, `--audit-log` JSONL output, `rsb completions <bash|zsh|fish>`, and Ubuntu AppArmor `apparmor_userns` reporting in `rsb info`.
+- **Portable Distribution:** Static `x86_64-unknown-linux-musl` CLI + `ubuntu-22.04` `librsb_ffi.so` (`SONAME`) release pipeline with GitHub Artifact Attestations, `SECURITY.md`, `flake.nix`, `bindings/python/pyproject.toml`, and `benchmarks/bench.sh`.
+
 ## [0.1.3] - 2026-11-23
 
 ### Added

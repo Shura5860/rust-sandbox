@@ -129,6 +129,9 @@ impl CowSession {
 
     /// Walk all `upper` directories and compute the list of Added / Modified / Deleted paths.
     pub fn collect_diffs(&self) -> Vec<CowChange> {
+        // Restore owner rwx on upper directories BEFORE walking so a sandbox running
+        // `chmod 0000 dir` cannot blind `collect_diffs()` with EACCES.
+        make_tree_removable(&self.staging_root);
         let mut changes = Vec::new();
         for m in &self.mounts {
             collect_upper_diff(&m.target_path, &m.upper_dir, Path::new(""), &mut changes);
@@ -197,17 +200,41 @@ pub(crate) fn collect_upper_diff(
             continue;
         }
 
-        let lower_exists = fs::symlink_metadata(&lower_path).is_ok();
+        let lower_meta = fs::symlink_metadata(&lower_path).ok();
+        let lower_exists = lower_meta.is_some();
         if meta.is_dir() {
-            if !lower_exists {
-                out.push(CowChange {
-                    target: lower_root.to_path_buf(),
-                    rel_path: rel.clone(),
-                    kind: CowChangeKind::Added,
-                });
+            match lower_meta {
+                None => {
+                    out.push(CowChange {
+                        target: lower_root.to_path_buf(),
+                        rel_path: rel.clone(),
+                        kind: CowChangeKind::Added,
+                    });
+                }
+                Some(lm) if !lm.is_dir() => {
+                    // File in lower was replaced by a directory in upper.
+                    out.push(CowChange {
+                        target: lower_root.to_path_buf(),
+                        rel_path: rel.clone(),
+                        kind: CowChangeKind::Modified,
+                    });
+                }
+                Some(_) => {
+                    if is_opaque_overlay_dir(&upper_path) {
+                        // Directory was removed and recreated inside OverlayFS (`user.overlay.opaque = "y"`):
+                        // recursively report any lower entries not recreated in `upper_path` as Deleted.
+                        collect_opaque_deletions(lower_root, &lower_path, &upper_path, &rel, out);
+                    }
+                }
             }
             collect_upper_diff(lower_root, upper_root, &rel, out);
         } else {
+            if let Some(lm) = lower_meta
+                && lm.is_dir()
+            {
+                // Directory in lower was replaced by a file in upper: mark lower descendants deleted.
+                collect_all_lower_deletions(lower_root, &lower_path, &rel, out);
+            }
             let kind = if lower_exists {
                 CowChangeKind::Modified
             } else {
@@ -218,6 +245,93 @@ pub(crate) fn collect_upper_diff(
                 rel_path: rel,
                 kind,
             });
+        }
+    }
+}
+
+/// Check whether `dir` carries the OverlayFS `user.overlay.opaque = "y"` xattr.
+fn is_opaque_overlay_dir(dir: &Path) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    const SYS_LGETXATTR: usize = 192;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_LGETXATTR: usize = 9;
+
+    let Ok(path_c) = CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut val = [0u8; 4];
+    let ret = unsafe {
+        rsb_sys::syscall4(
+            SYS_LGETXATTR,
+            path_c.as_ptr() as usize,
+            c"user.overlay.opaque".as_ptr() as usize,
+            val.as_mut_ptr() as usize,
+            val.len(),
+        )
+    };
+    matches!(rsb_sys::RawErrno::from_raw_ret(ret), Ok(n) if n >= 1 && val[0] == b'y')
+}
+
+fn collect_opaque_deletions(
+    lower_root: &Path,
+    lower_dir: &Path,
+    upper_dir: &Path,
+    rel_dir: &Path,
+    out: &mut Vec<CowChange>,
+) {
+    let Ok(entries) = fs::read_dir(lower_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let rel = rel_dir.join(&name);
+        let lower_child = lower_dir.join(&name);
+        let upper_child = upper_dir.join(&name);
+        let lower_is_dir = fs::symlink_metadata(&lower_child).is_ok_and(|m| m.is_dir());
+
+        match fs::symlink_metadata(&upper_child) {
+            Err(_) => {
+                out.push(CowChange {
+                    target: lower_root.to_path_buf(),
+                    rel_path: rel.clone(),
+                    kind: CowChangeKind::Deleted,
+                });
+                if lower_is_dir {
+                    collect_all_lower_deletions(lower_root, &lower_child, &rel, out);
+                }
+            }
+            Ok(um) if lower_is_dir && um.is_dir() => {
+                collect_opaque_deletions(lower_root, &lower_child, &upper_child, &rel, out);
+            }
+            Ok(_) if lower_is_dir => {
+                // Lower dir was replaced by a non-dir in upper; mark its children deleted.
+                collect_all_lower_deletions(lower_root, &lower_child, &rel, out);
+            }
+            Ok(_) => {}
+        }
+    }
+}
+
+fn collect_all_lower_deletions(
+    lower_root: &Path,
+    lower_dir: &Path,
+    rel_dir: &Path,
+    out: &mut Vec<CowChange>,
+) {
+    let Ok(entries) = fs::read_dir(lower_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let rel = rel_dir.join(&name);
+        let lower_child = lower_dir.join(&name);
+        out.push(CowChange {
+            target: lower_root.to_path_buf(),
+            rel_path: rel.clone(),
+            kind: CowChangeKind::Deleted,
+        });
+        if fs::symlink_metadata(&lower_child).is_ok_and(|m| m.is_dir()) {
+            collect_all_lower_deletions(lower_root, &lower_child, &rel, out);
         }
     }
 }

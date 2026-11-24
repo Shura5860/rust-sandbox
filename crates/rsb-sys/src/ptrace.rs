@@ -12,12 +12,27 @@ pub const PTRACE_PEEKDATA: usize = 2;
 pub const PTRACE_GETREGS: usize = 12;
 pub const PTRACE_SYSCALL: usize = 24;
 pub const PTRACE_SETOPTIONS: usize = 0x4200;
+pub const PTRACE_GETEVENTMSG: usize = 0x4201;
+pub const PTRACE_GETREGSET: usize = 0x4204;
+pub const NT_PRSTATUS: usize = 1;
 
 pub const PTRACE_O_TRACESYSGOOD: usize = 0x0000_0001;
 pub const PTRACE_O_TRACEFORK: usize = 0x0000_0002;
 pub const PTRACE_O_TRACEVFORK: usize = 0x0000_0004;
 pub const PTRACE_O_TRACECLONE: usize = 0x0000_0008;
+pub const PTRACE_O_TRACEEXEC: usize = 0x0000_0010;
 pub const PTRACE_O_EXITKILL: usize = 0x0010_0000;
+
+/// Linux `struct user_pt_regs` on `aarch64` (272 bytes).
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UserRegs {
+    pub regs: [u64; 31],
+    pub sp: u64,
+    pub pc: u64,
+    pub pstate: u64,
+}
 
 /// Linux `struct user_regs_struct` on `x86_64`.
 #[cfg(target_arch = "x86_64")]
@@ -87,6 +102,48 @@ pub fn getregs(pid: i32) -> Result<UserRegs, RawErrno> {
     };
     RawErrno::from_raw_ret(ret)?;
     Ok(regs)
+}
+
+/// Read general-purpose registers from a stopped `aarch64` tracee via `PTRACE_GETREGSET`.
+#[cfg(target_arch = "aarch64")]
+pub fn getregs(pid: i32) -> Result<UserRegs, RawErrno> {
+    #[repr(C)]
+    struct IoVec {
+        iov_base: *mut u8,
+        iov_len: usize,
+    }
+    let mut regs = UserRegs::default();
+    let mut iov = IoVec {
+        iov_base: (&mut regs as *mut UserRegs).cast::<u8>(),
+        iov_len: core::mem::size_of::<UserRegs>(),
+    };
+    let ret = unsafe {
+        syscall4(
+            SYS_PTRACE,
+            PTRACE_GETREGSET,
+            pid as usize,
+            NT_PRSTATUS,
+            &mut iov as *mut IoVec as usize,
+        )
+    };
+    RawErrno::from_raw_ret(ret)?;
+    Ok(regs)
+}
+
+/// Read the ptrace event message (e.g., new child PID on `PTRACE_EVENT_FORK/CLONE`).
+pub fn geteventmsg(pid: i32) -> Result<u64, RawErrno> {
+    let mut msg: u64 = 0;
+    let ret = unsafe {
+        syscall4(
+            SYS_PTRACE,
+            PTRACE_GETEVENTMSG,
+            pid as usize,
+            0,
+            &mut msg as *mut u64 as usize,
+        )
+    };
+    RawErrno::from_raw_ret(ret)?;
+    Ok(msg)
 }
 
 /// Read a single machine word from `addr` in `pid`'s address space via `PTRACE_PEEKDATA`.

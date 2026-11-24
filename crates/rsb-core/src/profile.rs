@@ -79,13 +79,56 @@ impl Default for SandboxProfile {
 }
 
 impl SandboxProfile {
+    /// Return a built-in security preset profile (`python-ai`, `node-build`, `strict-offline`).
+    pub fn preset(name: &str) -> Result<Self, SandboxError> {
+        match name {
+            "python-ai" => Ok(Self {
+                namespaces: true,
+                landlock: true,
+                seccomp: true,
+                allow_network: false,
+                auto_system_runtime: true,
+                memory_mb: Some(512),
+                pids: Some(64),
+                timeout_ms: Some(10_000),
+                ..Default::default()
+            }),
+            "node-build" => Ok(Self {
+                namespaces: true,
+                landlock: true,
+                seccomp: true,
+                allow_network: false,
+                auto_system_runtime: true,
+                memory_mb: Some(1024),
+                pids: Some(128),
+                timeout_ms: Some(30_000),
+                ..Default::default()
+            }),
+            "strict-offline" => Ok(Self {
+                namespaces: true,
+                landlock: true,
+                seccomp: true,
+                allow_network: false,
+                auto_system_runtime: true,
+                memory_mb: Some(256),
+                pids: Some(32),
+                timeout_ms: Some(5_000),
+                ..Default::default()
+            }),
+            other => Err(SandboxError::InvalidPolicy(format!(
+                "unknown preset '{other}' (available: python-ai, node-build, strict-offline)"
+            ))),
+        }
+    }
+
     /// Load and parse a `sandbox.toml` profile from disk.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, SandboxError> {
         let content = std::fs::read_to_string(path.as_ref())?;
         Self::from_toml(&content)
     }
 
-    /// Parse a `sandbox.toml` string without external dependencies.
+    /// Parse a `sandbox.toml` string without external dependencies (supports multiline arrays
+    /// and both basic `"..."` and literal `'...'` strings).
     pub fn from_toml(input: &str) -> Result<Self, SandboxError> {
         let mut profile = Self::default();
         let mut section = String::new();
@@ -93,12 +136,40 @@ impl SandboxProfile {
         let mut seen_keys = std::collections::BTreeSet::new();
         let mut seccomp_mode: Option<String> = None;
 
-        for (line_idx, raw_line) in input.lines().enumerate() {
-            let line_no = line_idx + 1;
-            let line = strip_comment(raw_line).trim();
-            if line.is_empty() {
+        // Pre-join multiline `[...]` arrays while preserving starting line numbers.
+        let mut logical_lines: Vec<(usize, String)> = Vec::new();
+        let mut acc: Option<(usize, String)> = None;
+        for (idx, raw_line) in input.lines().enumerate() {
+            let line_no = idx + 1;
+            let cleaned = strip_comment(raw_line).trim();
+            if cleaned.is_empty() {
                 continue;
             }
+            if let Some((start_no, mut buf)) = acc.take() {
+                buf.push(' ');
+                buf.push_str(cleaned);
+                if has_balanced_array(&buf) {
+                    logical_lines.push((start_no, buf));
+                } else {
+                    acc = Some((start_no, buf));
+                }
+            } else if let Some((_, rhs)) = cleaned.split_once('=')
+                && rhs.trim_start().starts_with('[')
+                && !has_balanced_array(cleaned)
+            {
+                acc = Some((line_no, cleaned.to_string()));
+            } else {
+                logical_lines.push((line_no, cleaned.to_string()));
+            }
+        }
+        if let Some((start_no, _)) = acc {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "sandbox.toml line {start_no}: unterminated multiline array `[...]`"
+            )));
+        }
+
+        for (line_no, line) in logical_lines {
+            let line = line.as_str();
 
             if line.starts_with('[') && line.ends_with(']') {
                 let sec = line[1..line.len() - 1].trim();
@@ -293,19 +364,20 @@ impl SandboxProfile {
         union_sorted(&mut self.allow_domains, &other.allow_domains);
         union_sorted(&mut self.allow_cidrs, &other.allow_cidrs);
 
-        // Paths promoted to `rw` do not need to be duplicated in `ro` / `ro_data`.
+        // Paths promoted to `rw` do not need to be duplicated in `ro` / `ro_data`;
+        // paths in `ro` do not need to be duplicated in `ro_data`.
         self.ro.retain(|p| !self.rw.contains(p));
-        self.ro_data.retain(|p| !self.rw.contains(p));
+        self.ro_data
+            .retain(|p| !self.rw.contains(p) && !self.ro.contains(p));
 
         match (&mut self.allow_syscalls, &other.allow_syscalls) {
             (Some(dst), Some(src)) => union_sorted(dst, src),
-            (None, Some(src)) => {
-                let mut v = src.clone();
-                v.sort_unstable();
-                v.dedup();
-                self.allow_syscalls = Some(v);
+            (Some(_), None) | (None, Some(_)) => {
+                // Merging a strict allowlist with a denylist profile cannot know the
+                // syscalls used by the denylist run; fall back safely to denylist mode.
+                self.allow_syscalls = None;
             }
-            _ => {}
+            (None, None) => {}
         }
     }
 
@@ -316,6 +388,10 @@ impl SandboxProfile {
             .landlock(self.landlock)
             .seccomp(self.seccomp)
             .allow_network(self.allow_network);
+
+        if self.transparent_tap {
+            builder = builder.transparent_tap();
+        }
 
         if let Some(ref allow) = self.allow_syscalls
             && self.seccomp
@@ -361,7 +437,8 @@ impl SandboxProfile {
 }
 
 fn strip_comment(line: &str) -> &str {
-    let mut in_quotes = false;
+    let mut in_double = false;
+    let mut in_single = false;
     let mut escaped = false;
     for (idx, ch) in line.char_indices() {
         if escaped {
@@ -369,13 +446,38 @@ fn strip_comment(line: &str) -> &str {
             continue;
         }
         match ch {
-            '\\' if in_quotes => escaped = true,
-            '"' => in_quotes = !in_quotes,
-            '#' if !in_quotes => return &line[..idx],
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '#' if !in_double && !in_single => return &line[..idx],
             _ => {}
         }
     }
     line
+}
+
+fn has_balanced_array(line: &str) -> bool {
+    let mut depth: i32 = 0;
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '[' if !in_double && !in_single => depth += 1,
+            ']' if !in_double && !in_single => depth -= 1,
+            _ => {}
+        }
+    }
+    // Single-line strings cannot span lines in TOML; if an unclosed quote leaves
+    // brackets balanced or we already closed all `[...]`, let the line parser report it.
+    depth <= 0
 }
 
 fn parse_bool(val: &str, line_no: usize) -> Result<bool, SandboxError> {
@@ -406,6 +508,16 @@ fn parse_u32(val: &str, line_no: usize) -> Result<u32, SandboxError> {
 }
 
 fn parse_string(val: &str, line_no: usize) -> Result<String, SandboxError> {
+    // Support TOML literal single-quoted strings `'...'` (no escape processing)
+    if val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2 {
+        let inner = &val[1..val.len() - 1];
+        if inner.contains('\'') {
+            return Err(SandboxError::InvalidPolicy(format!(
+                "sandbox.toml line {line_no}: unescaped `'` inside literal string `{val}`"
+            )));
+        }
+        return Ok(inner.to_string());
+    }
     if !(val.starts_with('"') && val.ends_with('"') && val.len() >= 2) {
         return Err(SandboxError::InvalidPolicy(format!(
             "sandbox.toml line {line_no}: expected quoted string, got `{val}`"
@@ -460,7 +572,8 @@ fn parse_path_array(val: &str, line_no: usize) -> Result<Vec<PathBuf>, SandboxEr
 
     let mut items = Vec::new();
     let mut cur = String::new();
-    let mut in_quotes = false;
+    let mut in_double = false;
+    let mut in_single = false;
     let mut escaped = false;
 
     for ch in inner.chars() {
@@ -471,16 +584,23 @@ fn parse_path_array(val: &str, line_no: usize) -> Result<Vec<PathBuf>, SandboxEr
             continue;
         }
         match ch {
-            '\\' if in_quotes => escaped = true,
-            '"' => {
-                in_quotes = !in_quotes;
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => {
+                in_double = !in_double;
                 cur.push(ch);
             }
-            ',' if !in_quotes => {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                cur.push(ch);
+            }
+            ',' if !in_double && !in_single => {
                 let item = cur.trim();
-                if !item.is_empty() {
-                    items.push(PathBuf::from(parse_string(item, line_no)?));
+                if item.is_empty() {
+                    return Err(SandboxError::InvalidPolicy(format!(
+                        "sandbox.toml line {line_no}: unexpected empty element before `,` in array"
+                    )));
                 }
+                items.push(PathBuf::from(parse_string(item, line_no)?));
                 cur.clear();
             }
             _ => cur.push(ch),
@@ -504,11 +624,18 @@ fn parse_u32_array(val: &str, line_no: usize) -> Result<Vec<u32>, SandboxError> 
     if inner.is_empty() {
         return Ok(Vec::new());
     }
+    let parts: Vec<&str> = inner.split(',').collect();
     let mut items = Vec::new();
-    for part in inner.split(',') {
+    for (idx, part) in parts.iter().enumerate() {
         let s = part.trim();
         if s.is_empty() {
-            continue;
+            // Allow a single trailing comma (e.g. `[1, 2,]`), reject leading/double commas (`[, 1]`, `[1, , 2]`).
+            if idx + 1 == parts.len() {
+                continue;
+            }
+            return Err(SandboxError::InvalidPolicy(format!(
+                "sandbox.toml line {line_no}: unexpected empty element before `,` in integer array"
+            )));
         }
         let n = parse_u32(s, line_no)?;
         items.push(n);
@@ -579,6 +706,18 @@ mod tests {
         let toml = p.to_toml();
         let parsed = SandboxProfile::from_toml(&toml).expect("parse generated toml");
         assert_eq!(parsed, p);
+
+        // Single-quoted literal strings with commas/quotes inside arrays & multiline arrays
+        let literal_toml = "[filesystem]\nro = [\n  '/tmp/a,b',\n  '/tmp/a\"b',\n]\n";
+        let lit = SandboxProfile::from_toml(literal_toml).expect("parse literal array");
+        assert_eq!(
+            lit.ro,
+            vec![PathBuf::from("/tmp/a,b"), PathBuf::from("/tmp/a\"b")]
+        );
+
+        // Double commas must be rejected
+        assert!(SandboxProfile::from_toml("[filesystem]\nro = [\"a\", , \"b\"]\n").is_err());
+        assert!(SandboxProfile::from_toml("[seccomp]\nallow_syscalls = [1, , 2]\n").is_err());
     }
 
     #[test]

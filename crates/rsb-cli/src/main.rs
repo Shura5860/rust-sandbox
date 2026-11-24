@@ -29,10 +29,14 @@ USAGE:
   rsb run [OPTIONS] -- <COMMAND> [ARGS...]
   rsb ai-exec [OPTIONS] -- <COMMAND> [ARGS...]
   rsb learn [--strict] [--merge] [--out <PATH>] -- <COMMAND> [ARGS...]
+  rsb session <start|exec|ls|stop> [ARGS...]
+  rsb completions <bash|zsh|fish>
   rsb zygote-bench [--no-ns] [--iters <N>]
 
 OPTIONS (rsb run / rsb ai-exec):
   --profile <PATH>      Load declarative sandbox.toml profile
+  --preset <NAME>       Built-in preset (python-ai, node-build, strict-offline)
+  --audit-log <PATH>    Append structured JSONL audit events to PATH
   --ro <PATH>           Allow read + execute access to PATH (repeatable)
   --ro-data <PATH>      Allow read-only (no execute) access to PATH (repeatable)
   --rw <PATH>           Allow read + write + execute access to PATH (repeatable)
@@ -83,6 +87,18 @@ fn cmd_info() -> ExitCode {
         Err(_) => println!("unpriv_userns:      unknown (sysctl not exposed)"),
     }
 
+    if let Ok(val) = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+    {
+        println!(
+            "apparmor_userns:    {}",
+            if val.trim() == "1" {
+                "restricted (1 — Ubuntu AppArmor may block rootless mount)"
+            } else {
+                "unrestricted (0)"
+            }
+        );
+    }
+
     match find_writable_cgroup_v2_dir() {
         Some(dir) => println!("cgroup_v2:          delegated ({})", dir.display()),
         None => println!("cgroup_v2:          not delegated (quotas will gracefully skip)"),
@@ -93,6 +109,8 @@ fn cmd_info() -> ExitCode {
 
 struct ParsedRunArgs {
     profile_path: Option<PathBuf>,
+    preset: Option<String>,
+    audit_log: Option<PathBuf>,
     ro_paths: Vec<PathBuf>,
     ro_data_paths: Vec<PathBuf>,
     rw_paths: Vec<PathBuf>,
@@ -103,7 +121,7 @@ struct ParsedRunArgs {
     allow_net: Option<bool>,
     allow_domains: Vec<String>,
     allow_cidrs: Vec<String>,
-    transparent_tap: bool,
+    transparent_tap: Option<bool>,
     use_ns: Option<bool>,
     use_landlock: Option<bool>,
     use_seccomp: Option<bool>,
@@ -121,6 +139,8 @@ struct ParsedRunArgs {
 fn parse_run_args(args: &[String], ai_mode: bool) -> Result<Option<ParsedRunArgs>, String> {
     let mut parsed = ParsedRunArgs {
         profile_path: None,
+        preset: None,
+        audit_log: None,
         ro_paths: Vec::new(),
         ro_data_paths: Vec::new(),
         rw_paths: Vec::new(),
@@ -131,7 +151,7 @@ fn parse_run_args(args: &[String], ai_mode: bool) -> Result<Option<ParsedRunArgs
         allow_net: None,
         allow_domains: Vec::new(),
         allow_cidrs: Vec::new(),
-        transparent_tap: false,
+        transparent_tap: None,
         use_ns: None,
         use_landlock: None,
         use_seccomp: None,
@@ -150,106 +170,174 @@ fn parse_run_args(args: &[String], ai_mode: bool) -> Result<Option<ParsedRunArgs
     let mut cmd_start: Option<usize> = None;
 
     while i < args.len() {
-        match args[i].as_str() {
-            "--" => {
-                cmd_start = Some(i + 1);
-                break;
+        let raw = args[i].as_str();
+        if raw == "--" {
+            cmd_start = Some(i + 1);
+            break;
+        }
+        let (flag, eq_val) = if raw.starts_with("--") {
+            match raw.split_once('=') {
+                Some((f, v)) => (f, Some(v)),
+                None => (raw, None),
             }
+        } else {
+            (raw, None)
+        };
+        let take_val = |idx: &mut usize, eq: Option<&str>, err: &str| -> Result<String, String> {
+            if let Some(v) = eq {
+                Ok(v.to_string())
+            } else {
+                *idx += 1;
+                args.get(*idx).cloned().ok_or_else(|| err.to_string())
+            }
+        };
+        let reject_eq = |flag_name: &str, eq: Option<&str>| -> Result<(), String> {
+            if eq.is_some() {
+                Err(format!("option '{flag_name}' does not take a value"))
+            } else {
+                Ok(())
+            }
+        };
+
+        match flag {
             "-h" | "--help" => {
+                reject_eq(flag, eq_val)?;
                 print_usage();
                 return Ok(None);
             }
             "--profile" => {
-                i += 1;
-                parsed.profile_path = Some(PathBuf::from(
-                    args.get(i).ok_or("--profile requires a path")?,
-                ));
+                parsed.profile_path = Some(PathBuf::from(take_val(
+                    &mut i,
+                    eq_val,
+                    "--profile requires a path",
+                )?));
+            }
+            "--preset" => {
+                parsed.preset = Some(take_val(
+                    &mut i,
+                    eq_val,
+                    "--preset requires a name (python-ai, node-build, strict-offline)",
+                )?);
+            }
+            "--audit-log" => {
+                parsed.audit_log = Some(PathBuf::from(take_val(
+                    &mut i,
+                    eq_val,
+                    "--audit-log requires a file path",
+                )?));
             }
             "--ro" => {
-                i += 1;
                 parsed
                     .ro_paths
-                    .push(PathBuf::from(args.get(i).ok_or("--ro requires a path")?));
+                    .push(PathBuf::from(take_val(&mut i, eq_val, "--ro requires a path")?));
             }
             "--ro-data" => {
-                i += 1;
-                parsed.ro_data_paths.push(PathBuf::from(
-                    args.get(i).ok_or("--ro-data requires a path")?,
-                ));
+                parsed.ro_data_paths.push(PathBuf::from(take_val(
+                    &mut i,
+                    eq_val,
+                    "--ro-data requires a path",
+                )?));
             }
             "--rw" => {
-                i += 1;
                 parsed
                     .rw_paths
-                    .push(PathBuf::from(args.get(i).ok_or("--rw requires a path")?));
+                    .push(PathBuf::from(take_val(&mut i, eq_val, "--rw requires a path")?));
             }
             "--cow" => {
-                i += 1;
                 parsed
                     .cow_paths
-                    .push(PathBuf::from(args.get(i).ok_or("--cow requires a path")?));
+                    .push(PathBuf::from(take_val(&mut i, eq_val, "--cow requires a path")?));
             }
             "--rootfs" => {
-                i += 1;
-                parsed.rootfs = Some(PathBuf::from(
-                    args.get(i).ok_or("--rootfs requires a path")?,
-                ));
+                parsed.rootfs = Some(PathBuf::from(take_val(
+                    &mut i,
+                    eq_val,
+                    "--rootfs requires a path",
+                )?));
             }
             "--cwd" => {
-                i += 1;
-                parsed.cwd = Some(PathBuf::from(args.get(i).ok_or("--cwd requires a path")?));
+                parsed.cwd = Some(PathBuf::from(take_val(
+                    &mut i,
+                    eq_val,
+                    "--cwd requires a path",
+                )?));
             }
             "--hostname" => {
-                i += 1;
-                parsed.hostname = Some(args.get(i).ok_or("--hostname requires a value")?.clone());
+                parsed.hostname = Some(take_val(&mut i, eq_val, "--hostname requires a value")?);
             }
             "--mem-mb" => {
-                i += 1;
-                let v = args.get(i).ok_or("--mem-mb requires an integer")?;
+                let v = take_val(&mut i, eq_val, "--mem-mb requires an integer")?;
                 parsed.mem_mb = Some(v.parse().map_err(|_| format!("invalid --mem-mb: {v}"))?);
             }
             "--pids" => {
-                i += 1;
-                let v = args.get(i).ok_or("--pids requires an integer")?;
+                let v = take_val(&mut i, eq_val, "--pids requires an integer")?;
                 parsed.pids_max = Some(v.parse().map_err(|_| format!("invalid --pids: {v}"))?);
             }
             "--cpu-pct" => {
-                i += 1;
-                let v = args.get(i).ok_or("--cpu-pct requires an integer")?;
+                let v = take_val(&mut i, eq_val, "--cpu-pct requires an integer")?;
                 parsed.cpu_pct = Some(v.parse().map_err(|_| format!("invalid --cpu-pct: {v}"))?);
             }
             "--timeout-ms" => {
-                i += 1;
-                let v = args.get(i).ok_or("--timeout-ms requires an integer")?;
+                let v = take_val(&mut i, eq_val, "--timeout-ms requires an integer")?;
                 parsed.timeout_ms =
                     Some(v.parse().map_err(|_| format!("invalid --timeout-ms: {v}"))?);
             }
             "--max-output" => {
-                i += 1;
-                let v = args.get(i).ok_or("--max-output requires an integer")?;
+                let v = take_val(&mut i, eq_val, "--max-output requires an integer")?;
                 parsed.max_output_bytes =
                     v.parse().map_err(|_| format!("invalid --max-output: {v}"))?;
             }
-            "--net" => parsed.allow_net = Some(true),
+            "--net" => {
+                reject_eq(flag, eq_val)?;
+                parsed.allow_net = Some(true);
+            }
             "--allow-domain" => {
-                i += 1;
-                parsed
-                    .allow_domains
-                    .push(args.get(i).ok_or("--allow-domain requires a hostname")?.clone());
+                parsed.allow_domains.push(take_val(
+                    &mut i,
+                    eq_val,
+                    "--allow-domain requires a hostname",
+                )?);
             }
             "--allow-cidr" => {
-                i += 1;
-                parsed
-                    .allow_cidrs
-                    .push(args.get(i).ok_or("--allow-cidr requires a CIDR rule")?.clone());
+                parsed.allow_cidrs.push(take_val(
+                    &mut i,
+                    eq_val,
+                    "--allow-cidr requires a CIDR rule",
+                )?);
             }
-            "--transparent-tap" => parsed.transparent_tap = true,
-            "--no-ns" => parsed.use_ns = Some(false),
-            "--no-landlock" => parsed.use_landlock = Some(false),
-            "--no-seccomp" => parsed.use_seccomp = Some(false),
-            "--no-sys-libs" => parsed.auto_sys_libs = Some(false),
-            "--stats" => parsed.show_stats = true,
-            other if other.starts_with('-') => return Err(format!("unknown option '{other}'")),
+            "--transparent-tap" => {
+                reject_eq(flag, eq_val)?;
+                parsed.transparent_tap = Some(true);
+            }
+            "--no-transparent-tap" => {
+                reject_eq(flag, eq_val)?;
+                parsed.transparent_tap = Some(false);
+            }
+            "--no-net" => {
+                reject_eq(flag, eq_val)?;
+                parsed.allow_net = Some(false);
+            }
+            "--no-ns" => {
+                reject_eq(flag, eq_val)?;
+                parsed.use_ns = Some(false);
+            }
+            "--no-landlock" => {
+                reject_eq(flag, eq_val)?;
+                parsed.use_landlock = Some(false);
+            }
+            "--no-seccomp" => {
+                reject_eq(flag, eq_val)?;
+                parsed.use_seccomp = Some(false);
+            }
+            "--no-sys-libs" => {
+                reject_eq(flag, eq_val)?;
+                parsed.auto_sys_libs = Some(false);
+            }
+            "--stats" => {
+                reject_eq(flag, eq_val)?;
+                parsed.show_stats = true;
+            }
+            other if other.starts_with('-') => return Err(format!("unknown option '{raw}'")),
             _ => {
                 cmd_start = Some(i);
                 break;
@@ -276,9 +364,11 @@ fn build_sandbox(
     ),
     String,
 > {
-    let mut profile = match p.profile_path {
-        Some(ref path) => SandboxProfile::from_file(path).map_err(|e| e.to_string())?,
-        None => SandboxProfile::default(),
+    let mut profile = match (&p.profile_path, &p.preset) {
+        (Some(_), Some(_)) => return Err("cannot combine --profile and --preset".into()),
+        (Some(path), None) => SandboxProfile::from_file(path).map_err(|e| e.to_string())?,
+        (None, Some(name)) => SandboxProfile::preset(name).map_err(|e| e.to_string())?,
+        (None, None) => SandboxProfile::default(),
     };
 
     if let Some(v) = p.allow_net {
@@ -322,7 +412,7 @@ fn build_sandbox(
     all_domains.extend(p.allow_domains.iter().cloned());
     let mut all_cidrs = profile.allow_cidrs.clone();
     all_cidrs.extend(p.allow_cidrs.iter().cloned());
-    let use_transparent_tap = p.transparent_tap || profile.transparent_tap;
+    let use_transparent_tap = p.transparent_tap.unwrap_or(profile.transparent_tap);
 
     let has_egress_rules = !all_domains.is_empty() || !all_cidrs.is_empty();
     let egress_policy = if has_egress_rules || use_transparent_tap {
@@ -435,6 +525,26 @@ fn cmd_run(args: &[String]) -> ExitCode {
 
     match run_res {
         Ok(report) => {
+            if let Some(ref audit_path) = parsed.audit_log {
+                let exit_code = report
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "null".into());
+                let signal = report
+                    .signal
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "null".into());
+                let ev = format!(
+                    "{{\"ok\":{},\"exit_code\":{},\"signal\":{},\"timed_out\":{},\"setup_ms\":{:.3},\"total_ms\":{:.3}}}",
+                    report.success(),
+                    exit_code,
+                    signal,
+                    report.timed_out,
+                    report.setup_time.as_secs_f64() * 1000.0,
+                    report.total_time.as_secs_f64() * 1000.0,
+                );
+                append_audit_log(audit_path, &parsed.command, &ev);
+            }
             if parsed.show_stats {
                 eprintln!(
                     "[rsb] setup={:.3}ms total={:.3}ms timed_out={} ns={} landlock={} seccomp_insns={} cgroup={}",
@@ -461,6 +571,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
         }
         Err(e) => {
+            if let Some(ref audit_path) = parsed.audit_log {
+                let ev = format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&e.to_string()));
+                append_audit_log(audit_path, &parsed.command, &ev);
+            }
             eprintln!("rsb error: {e}");
             ExitCode::from(1)
         }
@@ -480,7 +594,11 @@ fn cmd_ai_exec(args: &[String]) -> ExitCode {
     let (builder, _proxy, tap_policy) = match build_sandbox(&parsed) {
         Ok(triple) => triple,
         Err(msg) => {
-            println!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&msg));
+            let err_json = format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&msg));
+            if let Some(ref audit_path) = parsed.audit_log {
+                append_audit_log(audit_path, &parsed.command, &err_json);
+            }
+            println!("{err_json}");
             return ExitCode::from(2);
         }
     };
@@ -499,7 +617,11 @@ fn cmd_ai_exec(args: &[String]) -> ExitCode {
 
     match cap_res {
         Ok(cap) => {
-            println!("{}", format_ai_exec_json(&cap));
+            let json = format_ai_exec_json(&cap);
+            if let Some(ref audit_path) = parsed.audit_log {
+                append_audit_log(audit_path, &parsed.command, &json);
+            }
+            println!("{json}");
             if cap.report.success() {
                 ExitCode::SUCCESS
             } else if cap.report.timed_out {
@@ -513,16 +635,19 @@ fn cmd_ai_exec(args: &[String]) -> ExitCode {
             }
         }
         Err(e) => {
-            println!(
+            let err_json = format!(
                 "{{\"ok\":false,\"error\":\"{}\"}}",
                 json_escape(&e.to_string())
             );
+            if let Some(ref audit_path) = parsed.audit_log {
+                append_audit_log(audit_path, &parsed.command, &err_json);
+            }
+            println!("{err_json}");
             ExitCode::from(1)
         }
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn cmd_learn(args: &[String]) -> ExitCode {
     let mut out_path: Option<PathBuf> = None;
     let mut strict_allowlist = false;
@@ -531,27 +656,57 @@ fn cmd_learn(args: &[String]) -> ExitCode {
     let mut cmd_start: Option<usize> = None;
 
     while i < args.len() {
-        match args[i].as_str() {
-            "--" => {
-                cmd_start = Some(i + 1);
-                break;
+        let raw = args[i].as_str();
+        if raw == "--" {
+            cmd_start = Some(i + 1);
+            break;
+        }
+        let (flag, eq_val) = if raw.starts_with("--") {
+            match raw.split_once('=') {
+                Some((f, v)) => (f, Some(v)),
+                None => (raw, None),
             }
+        } else {
+            (raw, None)
+        };
+        match flag {
             "-h" | "--help" => {
+                if eq_val.is_some() {
+                    eprintln!("rsb learn: option '{flag}' does not take a value");
+                    return ExitCode::from(2);
+                }
                 print_usage();
                 return ExitCode::SUCCESS;
             }
-            "--strict" => strict_allowlist = true,
-            "--merge" => merge = true,
-            "--out" | "-o" => {
-                i += 1;
-                let Some(p) = args.get(i) else {
-                    eprintln!("rsb learn: --out requires a file path");
+            "--strict" => {
+                if eq_val.is_some() {
+                    eprintln!("rsb learn: option '--strict' does not take a value");
                     return ExitCode::from(2);
+                }
+                strict_allowlist = true;
+            }
+            "--merge" => {
+                if eq_val.is_some() {
+                    eprintln!("rsb learn: option '--merge' does not take a value");
+                    return ExitCode::from(2);
+                }
+                merge = true;
+            }
+            "--out" | "-o" => {
+                let p = if let Some(v) = eq_val {
+                    v.to_string()
+                } else {
+                    i += 1;
+                    let Some(v) = args.get(i) else {
+                        eprintln!("rsb learn: --out requires a file path");
+                        return ExitCode::from(2);
+                    };
+                    v.clone()
                 };
                 out_path = Some(PathBuf::from(p));
             }
             other if other.starts_with('-') => {
-                eprintln!("rsb learn: unknown option '{other}'");
+                eprintln!("rsb learn: unknown option '{raw}'");
                 return ExitCode::from(2);
             }
             _ => {
@@ -579,6 +734,39 @@ fn cmd_learn(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // Load existing profile BEFORE tracing when `--merge` is requested so we can
+    // keep `seccomp` mode consistent (`allowlist` vs `denylist`).
+    let existing_for_merge = if merge
+        && let Some(ref path) = out_path
+        && path.exists()
+    {
+        let existing = match SandboxProfile::from_file(path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "rsb learn: failed to load existing {} for --merge: {e}",
+                    path.display()
+                );
+                return ExitCode::from(1);
+            }
+        };
+        if existing.allow_syscalls.is_some() && !strict_allowlist {
+            eprintln!(
+                "[rsb learn] existing profile uses seccomp allowlist; auto-enabling --strict for --merge"
+            );
+            strict_allowlist = true;
+        } else if existing.allow_syscalls.is_none() && strict_allowlist {
+            eprintln!(
+                "rsb learn: cannot merge --strict allowlist into existing denylist profile {} (re-learn without --merge or without --strict)",
+                path.display()
+            );
+            return ExitCode::from(2);
+        }
+        Some(existing)
+    } else {
+        None
+    };
+
     match rsb_core::learn_policy_with_options(&cmd[0], &cmd[1..], strict_allowlist) {
         Ok(report) => {
             eprintln!(
@@ -589,17 +777,7 @@ fn cmd_learn(args: &[String]) -> ExitCode {
                 report.network_used,
                 if strict_allowlist { "allowlist" } else { "denylist" }
             );
-            let final_profile = if merge
-                && let Some(ref path) = out_path
-                && path.exists()
-            {
-                let mut existing = match SandboxProfile::from_file(path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("rsb learn: failed to load existing {} for --merge: {e}", path.display());
-                        return ExitCode::from(1);
-                    }
-                };
+            let final_profile = if let Some(mut existing) = existing_for_merge {
                 existing.merge(&report.profile);
                 existing
             } else {
@@ -627,12 +805,6 @@ fn cmd_learn(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn cmd_learn(_args: &[String]) -> ExitCode {
-    eprintln!("rsb learn is currently implemented for x86_64 Linux");
-    ExitCode::from(1)
 }
 
 /// Zero-dependency JSON serializer for `rsb ai-exec`.
@@ -738,17 +910,41 @@ fn cmd_zygote_bench(args: &[String]) -> ExitCode {
     let mut iters: usize = 10;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        let raw = args[i].as_str();
+        let (flag, eq_val) = if raw.starts_with("--") {
+            match raw.split_once('=') {
+                Some((f, v)) => (f, Some(v)),
+                None => (raw, None),
+            }
+        } else {
+            (raw, None)
+        };
+        match flag {
             "-h" | "--help" => {
+                if eq_val.is_some() {
+                    eprintln!("rsb zygote-bench: option '{flag}' does not take a value");
+                    return ExitCode::from(2);
+                }
                 println!("USAGE: rsb zygote-bench [--no-ns] [--iters <N>]");
                 return ExitCode::SUCCESS;
             }
-            "--no-ns" => use_ns = false,
-            "--iters" => {
-                i += 1;
-                let Some(v) = args.get(i) else {
-                    eprintln!("rsb zygote-bench: --iters requires an integer");
+            "--no-ns" => {
+                if eq_val.is_some() {
+                    eprintln!("rsb zygote-bench: option '--no-ns' does not take a value");
                     return ExitCode::from(2);
+                }
+                use_ns = false;
+            }
+            "--iters" => {
+                let v = if let Some(val) = eq_val {
+                    val.to_string()
+                } else {
+                    i += 1;
+                    let Some(val) = args.get(i) else {
+                        eprintln!("rsb zygote-bench: --iters requires an integer");
+                        return ExitCode::from(2);
+                    };
+                    val.clone()
                 };
                 match v.parse::<usize>() {
                     Ok(n) if n > 0 => iters = n,
@@ -758,8 +954,8 @@ fn cmd_zygote_bench(args: &[String]) -> ExitCode {
                     }
                 }
             }
-            other => {
-                eprintln!("rsb zygote-bench: unknown option '{other}'");
+            _ => {
+                eprintln!("rsb zygote-bench: unknown option '{raw}'");
                 return ExitCode::from(2);
             }
         }
@@ -853,6 +1049,304 @@ fn cmd_zygote_bench(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn append_audit_log(path: &std::path::Path, cmd: &[String], event_json: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let prog = cmd.first().map(String::as_str).unwrap_or("");
+    let line = format!(
+        "{{\"ts\":{ts},\"program\":\"{}\",\"event\":{event_json}}}\n",
+        json_escape(prog)
+    );
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                eprintln!(
+                    "rsb: warning: failed to write audit log {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "rsb: warning: failed to open audit log {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn cmd_completions(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("bash") => {
+            println!(
+                "_rsb() {{\n  local cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n  if [[ $COMP_CWORD -eq 1 ]]; then\n    COMPREPLY=( $(compgen -W \"info run ai-exec learn session completions zygote-bench\" -- \"$cur\") )\n  else\n    COMPREPLY=( $(compgen -W \"--profile --preset --audit-log --ro --ro-data --rw --cow --rootfs --cwd --hostname --net --no-net --allow-domain --allow-cidr --transparent-tap --no-transparent-tap --no-ns --no-landlock --no-seccomp --no-sys-libs --mem-mb --pids --cpu-pct --timeout-ms --max-output --stats --strict --merge --out\" -- \"$cur\") )\n  fi\n}}\ncomplete -F _rsb rsb"
+            );
+            ExitCode::SUCCESS
+        }
+        Some("zsh") => {
+            println!(
+                "#compdef rsb\n_arguments '1:command:(info run ai-exec learn session completions zygote-bench)' '*:args:_files'"
+            );
+            ExitCode::SUCCESS
+        }
+        Some("fish") => {
+            println!(
+                "complete -c rsb -n '__fish_use_subcommand' -a 'info run ai-exec learn session completions zygote-bench'"
+            );
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("USAGE: rsb completions <bash|zsh|fish>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn ensure_secure_sessions_root() -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let uid = std::fs::metadata("/proc/self")
+        .map(|m| m.uid())
+        .unwrap_or(0);
+    let root = if let Some(xdg) = env::var_os("XDG_RUNTIME_DIR")
+        && !xdg.is_empty()
+        && PathBuf::from(&xdg).is_absolute()
+    {
+        PathBuf::from(xdg).join("rsb-sessions")
+    } else {
+        std::env::temp_dir().join(format!("rsb-sessions-{uid}"))
+    };
+
+    match std::fs::symlink_metadata(&root) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(format!(
+                    "sessions root '{}' is not a regular directory",
+                    root.display()
+                ));
+            }
+            if meta.uid() != uid {
+                return Err(format!(
+                    "sessions root '{}' is owned by uid {}, expected {uid}",
+                    root.display(),
+                    meta.uid()
+                ));
+            }
+            if (meta.mode() & 0o077) != 0 {
+                return Err(format!(
+                    "sessions root '{}' has unsafe permissions {:o} (expected 0700)",
+                    root.display(),
+                    meta.mode() & 0o777
+                ));
+            }
+            Ok(root)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .map_err(|err| format!("failed to create sessions root '{}': {err}", root.display()))?;
+            Ok(root)
+        }
+        Err(e) => Err(format!(
+            "failed to inspect sessions root '{}': {e}",
+            root.display()
+        )),
+    }
+}
+
+fn generate_session_id() -> String {
+    use std::io::Read as _;
+    let mut bytes = [0u8; 8];
+    let val = if let Ok(mut f) = std::fs::File::open("/dev/urandom")
+        && f.read_exact(&mut bytes).is_ok()
+    {
+        u64::from_ne_bytes(bytes)
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        nanos ^ ((std::process::id() as u64) << 32) ^ (&bytes as *const [u8; 8] as usize as u64)
+    };
+    format!("s{val:016x}")
+}
+
+fn cmd_session(args: &[String]) -> ExitCode {
+    let Some(action) = args.first().map(String::as_str) else {
+        eprintln!("USAGE: rsb session <start|exec|ls|stop> [ARGS...]");
+        return ExitCode::from(2);
+    };
+    let root = match ensure_secure_sessions_root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("rsb session: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match action {
+        "start" => {
+            let mut preset = "python-ai".to_string();
+            let mut i = 1;
+            while i < args.len() {
+                let raw = args[i].as_str();
+                let (flag, eq_val) = if raw.starts_with("--") {
+                    match raw.split_once('=') {
+                        Some((f, v)) => (f, Some(v)),
+                        None => (raw, None),
+                    }
+                } else {
+                    (raw, None)
+                };
+                match flag {
+                    "--preset" => {
+                        let p = if let Some(v) = eq_val {
+                            v.to_string()
+                        } else {
+                            i += 1;
+                            let Some(v) = args.get(i) else {
+                                eprintln!("rsb session start: --preset requires a name");
+                                return ExitCode::from(2);
+                            };
+                            v.clone()
+                        };
+                        preset = p;
+                    }
+                    "-h" | "--help" => {
+                        println!("USAGE: rsb session start [--preset <NAME>]");
+                        return ExitCode::SUCCESS;
+                    }
+                    _ => {
+                        eprintln!("rsb session start: unknown option '{raw}'");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            let mut profile = match SandboxProfile::preset(&preset) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("rsb session start: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let id = generate_session_id();
+            let sdir = root.join(&id);
+            let work = sdir.join("work");
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&sdir) {
+                    eprintln!("rsb session start: failed to create session dir: {e}");
+                    return ExitCode::from(1);
+                }
+                if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&work) {
+                    let _ = std::fs::remove_dir_all(&sdir);
+                    eprintln!("rsb session start: failed to create work dir: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+            profile.rw.push(work.clone());
+            if let Err(e) = std::fs::write(sdir.join("profile.toml"), profile.to_toml()) {
+                let _ = std::fs::remove_dir_all(&sdir);
+                eprintln!("rsb session start: {e}");
+                return ExitCode::from(1);
+            }
+            println!("{id}");
+            ExitCode::SUCCESS
+        }
+        "ls" => {
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for e in entries.flatten() {
+                    if e.path().is_dir() {
+                        println!("{}", e.file_name().to_string_lossy());
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        "stop" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("USAGE: rsb session stop <SESSION_ID>");
+                return ExitCode::from(2);
+            };
+            if !is_valid_session_id(id) {
+                eprintln!("rsb session stop: invalid session id '{id}'");
+                return ExitCode::from(2);
+            }
+            let sdir = root.join(id);
+            if !sdir.exists() {
+                eprintln!("rsb session stop: session '{id}' not found");
+                return ExitCode::from(1);
+            }
+            if let Err(e) = std::fs::remove_dir_all(&sdir) {
+                eprintln!("rsb session stop: failed to remove session '{id}': {e}");
+                return ExitCode::from(1);
+            }
+            ExitCode::SUCCESS
+        }
+        "exec" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("USAGE: rsb session exec <SESSION_ID> -- <CMD> [ARGS...]");
+                return ExitCode::from(2);
+            };
+            if !is_valid_session_id(id) {
+                eprintln!("rsb session exec: invalid session id '{id}'");
+                return ExitCode::from(2);
+            }
+            for arg in &args[2..] {
+                if arg == "--" {
+                    break;
+                }
+                if !arg.starts_with('-') {
+                    break;
+                }
+                let flag = arg.split_once('=').map(|(f, _)| f).unwrap_or(arg.as_str());
+                if flag == "--profile" || flag == "--preset" {
+                    eprintln!(
+                        "rsb session exec: cannot override session profile with '{flag}'"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+            let sdir = root.join(id);
+            let prof_path = sdir.join("profile.toml");
+            let work = sdir.join("work");
+            if !prof_path.is_file() {
+                eprintln!("rsb session exec: session '{id}' not found");
+                return ExitCode::from(1);
+            }
+            let mut forwarded = vec![
+                "--profile".to_string(),
+                prof_path.to_string_lossy().into_owned(),
+                "--cwd".to_string(),
+                work.to_string_lossy().into_owned(),
+            ];
+            forwarded.extend(args[2..].iter().cloned());
+            cmd_ai_exec(&forwarded)
+        }
+        other => {
+            eprintln!("rsb session: unknown action '{other}' (expected start, exec, ls, stop)");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let Some(subcmd) = args.first().map(String::as_str) else {
@@ -865,6 +1359,8 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args[1..]),
         "ai-exec" => cmd_ai_exec(&args[1..]),
         "learn" => cmd_learn(&args[1..]),
+        "session" => cmd_session(&args[1..]),
+        "completions" => cmd_completions(&args[1..]),
         "zygote-bench" => cmd_zygote_bench(&args[1..]),
         "-h" | "--help" => {
             print_usage();

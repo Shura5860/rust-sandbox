@@ -17,6 +17,8 @@ pub const SIGCHLD: u64 = 17;
 
 /// Namespace and process creation flags for `clone3`.
 pub mod flags {
+    /// Time namespace flag — valid for `unshare(2)` / `setns(2)` only (Linux `clone3` rejects it with `EINVAL`).
+    pub const CLONE_NEWTIME: u64 = 0x0000_0080;
     pub const CLONE_NEWNS: u64 = 0x0002_0000;
     pub const CLONE_NEWCGROUP: u64 = 0x0200_0000;
     pub const CLONE_NEWUTS: u64 = 0x0400_0000;

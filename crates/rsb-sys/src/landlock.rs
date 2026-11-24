@@ -1,4 +1,4 @@
-//! Direct Linux Landlock LSM syscall wrappers (ABI v1 through v5).
+//! Direct Linux Landlock LSM syscall wrappers (ABI v1 through v6).
 //!
 //! Landlock provides unprivileged, stackable filesystem (and network in v4+)
 //! access control directly in the kernel without root or complex bind-mount trees.
@@ -16,6 +16,38 @@ pub const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 
 /// Rule type for filesystem path-beneath rules.
 pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+/// Rule type for TCP port network rules (ABI v4+).
+pub const LANDLOCK_RULE_NET_PORT: u32 = 2;
+
+/// Landlock TCP network access rights (ABI v4+).
+pub mod access_net {
+    pub const BIND_TCP: u64 = 1 << 0;
+    pub const CONNECT_TCP: u64 = 1 << 1;
+
+    /// All network access flags supported by `abi` (0 for ABI < 4).
+    pub const fn handled_for_abi(abi: u32) -> u64 {
+        if abi >= 4 {
+            BIND_TCP | CONNECT_TCP
+        } else {
+            0
+        }
+    }
+}
+
+/// Landlock IPC scope flags (ABI v6+).
+pub mod scope {
+    pub const ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+    pub const SIGNAL: u64 = 1 << 1;
+
+    /// All IPC scope flags supported by `abi` (0 for ABI < 6).
+    pub const fn handled_for_abi(abi: u32) -> u64 {
+        if abi >= 6 {
+            ABSTRACT_UNIX_SOCKET | SIGNAL
+        } else {
+            0
+        }
+    }
+}
 
 /// Landlock filesystem access rights (bitflags).
 pub mod access_fs {
@@ -116,12 +148,13 @@ pub mod access_fs {
     }
 }
 
-/// Kernel `struct landlock_ruleset_attr`.
+/// Kernel `struct landlock_ruleset_attr` (ABI v1–v6+).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RulesetAttr {
     pub handled_access_fs: u64,
     pub handled_access_net: u64,
+    pub scoped: u64,
 }
 
 /// Kernel `struct landlock_path_beneath_attr`.
@@ -130,6 +163,14 @@ pub struct RulesetAttr {
 pub struct PathBeneathAttr {
     pub allowed_access: u64,
     pub parent_fd: i32,
+}
+
+/// Kernel `struct landlock_net_port_attr` (ABI v4+).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NetPortAttr {
+    pub allowed_access: u64,
+    pub port: u64,
 }
 
 /// Probe the running kernel's highest supported Landlock ABI version.
@@ -150,22 +191,62 @@ pub fn abi_version() -> Result<u32, RawErrno> {
 
 /// Create a Landlock ruleset FD for the specified `handled_access_fs` mask.
 pub fn create_ruleset(handled_access_fs: u64) -> Result<OwnedFd, RawErrno> {
-    // Pass only the v1..v3 size (8 bytes) when handled_access_net == 0 so
-    // older kernels (ABI v1-v3) accept the struct size cleanly.
+    create_ruleset_ex(handled_access_fs, 0, 0)
+}
+
+/// Create a Landlock ruleset FD supporting FS (v1+), TCP network (v4+), and IPC scope (v6+).
+///
+/// Passes the minimal kernel struct size (`8`, `16`, or `24` bytes) required by the
+/// non-zero masks so older kernels (ABI v1–v5) accept the call cleanly.
+pub fn create_ruleset_ex(
+    handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
+) -> Result<OwnedFd, RawErrno> {
     let attr = RulesetAttr {
         handled_access_fs,
-        handled_access_net: 0,
+        handled_access_net,
+        scoped,
+    };
+    let size = if scoped != 0 {
+        24usize
+    } else if handled_access_net != 0 {
+        16usize
+    } else {
+        8usize
     };
     let ret = unsafe {
         syscall3(
             SYS_LANDLOCK_CREATE_RULESET,
             &attr as *const RulesetAttr as usize,
-            core::mem::size_of::<u64>(),
+            size,
             0,
         )
     };
     let fd = RawErrno::from_raw_ret(ret)? as RawFd;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Add a `LANDLOCK_RULE_NET_PORT` rule (ABI v4+) to an open ruleset FD.
+pub fn add_net_port_rule(
+    ruleset: &OwnedFd,
+    port: u16,
+    allowed_access: u64,
+) -> Result<(), RawErrno> {
+    let attr = NetPortAttr {
+        allowed_access,
+        port: port as u64,
+    };
+    let ret = unsafe {
+        syscall4(
+            SYS_LANDLOCK_ADD_RULE,
+            ruleset.as_raw_fd() as usize,
+            LANDLOCK_RULE_NET_PORT as usize,
+            &attr as *const NetPortAttr as usize,
+            0,
+        )
+    };
+    RawErrno::from_raw_ret(ret).map(|_| ())
 }
 
 /// Add a `LANDLOCK_RULE_PATH_BENEATH` rule to an open ruleset FD.

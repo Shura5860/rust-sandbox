@@ -62,6 +62,14 @@ class RustSandboxFFI:
         ]
         self._lib.rsb_exec_json.restype = ctypes.c_void_p
 
+        self._lib.rsb_exec_profile_toml_json.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.c_size_t,
+        ]
+        self._lib.rsb_exec_profile_toml_json.restype = ctypes.c_void_p
+
         self._lib.rsb_string_free.argtypes = [ctypes.c_void_p]
         self._lib.rsb_string_free.restype = None
 
@@ -122,6 +130,26 @@ class RustSandboxFFI:
         )
         if not raw_ptr:
             raise RuntimeError("rsb_exec_json returned NULL")
+        try:
+            payload = ctypes.string_at(raw_ptr).decode("utf-8")
+            return json.loads(payload)
+        finally:
+            self._lib.rsb_string_free(raw_ptr)
+
+    def exec_with_profile_toml(self, profile_toml: str, command: Sequence[str]) -> dict[str, Any]:
+        """Execute a command using a full `sandbox.toml` profile string."""
+        if isinstance(command, (str, bytes)):
+            raise TypeError("command must be a sequence of arguments, not a string or bytes")
+        if not command:
+            raise ValueError("command must not be empty")
+        toml_bytes = _encode_c_str(profile_toml, "profile_toml")
+        prog = _encode_c_str(command[0], "command[0]")
+        rest = [_encode_c_str(a, f"command[{i + 1}]") for i, a in enumerate(command[1:])]
+        argv_arr = (ctypes.c_char_p * len(rest))(*rest) if rest else None
+
+        raw_ptr = self._lib.rsb_exec_profile_toml_json(toml_bytes, prog, argv_arr, len(rest))
+        if not raw_ptr:
+            raise RuntimeError("rsb_exec_profile_toml_json returned NULL")
         try:
             payload = ctypes.string_at(raw_ptr).decode("utf-8")
             return json.loads(payload)

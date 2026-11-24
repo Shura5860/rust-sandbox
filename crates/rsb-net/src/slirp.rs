@@ -14,7 +14,7 @@
 
 use crate::dns::{build_dns_a_response, build_dns_refused, parse_dns_query};
 use crate::policy::EgressPolicy;
-use crate::sni::{extract_tls_sni, tls_record_expected_len};
+use crate::sni::{MAX_CLIENT_HELLO_BYTES, extract_tls_sni, tls_record_expected_len};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
@@ -25,10 +25,10 @@ use smoltcp::wire::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -128,17 +128,29 @@ enum UpstreamState {
     Idle,
     Connecting(Receiver<io::Result<TcpStream>>),
     Connected(TcpStream),
+    Closed,
+}
+
+struct WorkerGuard(Arc<AtomicUsize>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 struct ActiveTcpConn {
     handle: SocketHandle,
     dst_ip: Ipv4Addr,
     dst_port: u16,
-    validated_domain: Option<String>,
+    pending_syn: Option<(Ipv4Addr, u16)>,
+    validated_domains: Vec<String>,
     sni_checked: bool,
     sni_buf: Vec<u8>,
     tx_pending: VecDeque<u8>,
+    guest_eof_sent: bool,
     upstream: UpstreamState,
+    last_activity: Instant,
 }
 
 struct AsyncDnsReply {
@@ -147,6 +159,10 @@ struct AsyncDnsReply {
     resolved_ips: Vec<Ipv4Addr>,
     response_bytes: Vec<u8>,
 }
+
+const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
+const MAX_BG_WORKERS: usize = 32;
+const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Transparent L2/L3 `smoltcp` userspace network bridge enforcing [`EgressPolicy`].
 pub struct SlirpBridge {
@@ -158,8 +174,13 @@ pub struct SlirpBridge {
     dns_handle: SocketHandle,
     dns_tx: Sender<AsyncDnsReply>,
     dns_rx: Receiver<AsyncDnsReply>,
-    dns_cache: HashMap<Ipv4Addr, String>,
+    /// Multi-domain TTL cache (`ip -> [(domain, expires_at)]`) so shared CDN IPs
+    /// serving multiple allowed domains never overwrite each other's SNI validation.
+    dns_cache: HashMap<Ipv4Addr, Vec<(String, Instant)>>,
     tcp_conns: Vec<ActiveTcpConn>,
+    bg_workers: Arc<std::sync::atomic::AtomicUsize>,
+    egress_window_start: Instant,
+    egress_window_bytes: u64,
     #[cfg(test)]
     upstream_override: Option<SocketAddr>,
 }
@@ -200,6 +221,9 @@ impl SlirpBridge {
             dns_rx,
             dns_cache: HashMap::new(),
             tcp_conns: Vec::new(),
+            bg_workers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            egress_window_start: Instant::now(),
+            egress_window_bytes: 0,
             #[cfg(test)]
             upstream_override: None,
         }
@@ -210,15 +234,44 @@ impl SlirpBridge {
     /// Performs L3/L4 `EgressPolicy` inspection on TCP `SYN` frames *before* `smoltcp`
     /// even sees them, so disallowed destinations are dropped with zero host socket activity.
     pub fn ingest_guest_frame(&mut self, frame: Vec<u8>) {
-        if let Some((dst_ip, dst_port)) = inspect_tcp_syn(&frame) {
-            let domain = self.dns_cache.get(&dst_ip).map(String::as_str);
-            if !self.policy.check_ip(IpAddr::V4(dst_ip), dst_port, domain).is_allowed() {
+        if let Some((src_ip, src_port, dst_ip, dst_port)) = inspect_tcp_syn(&frame) {
+            let now = Instant::now();
+            let cached_domains: Vec<String> = self
+                .dns_cache
+                .get(&dst_ip)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|(_, exp)| *exp > now)
+                        .map(|(d, _)| d.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let allowed_domains: Vec<String> = cached_domains
+                .into_iter()
+                .filter(|d| {
+                    self.policy
+                        .check_ip(IpAddr::V4(dst_ip), dst_port, Some(d))
+                        .is_allowed()
+                })
+                .collect();
+
+            let allowed = if !allowed_domains.is_empty() {
+                true
+            } else {
+                self.policy
+                    .check_ip(IpAddr::V4(dst_ip), dst_port, None)
+                    .is_allowed()
+            };
+
+            if !allowed {
                 self.stats.tcp_blocked += 1;
                 // Silently drop SYN — host never touches the network!
                 return;
             }
             self.stats.tcp_allowed += 1;
-            self.ensure_tcp_listener(dst_ip, dst_port, domain.map(str::to_string));
+            self.ensure_tcp_listener(src_ip, src_port, dst_ip, dst_port, allowed_domains);
         }
 
         self.device.push_rx(frame);
@@ -262,26 +315,50 @@ impl SlirpBridge {
                 tv_nsec: 5_000_000, // 5ms poll tick
             };
 
+            let mut tx_retry: VecDeque<Vec<u8>> = VecDeque::new();
             while !shutdown_bg.load(Ordering::Relaxed) {
-                let mut pfds = [PollFd::new(&tap_fd, PollFlags::IN)];
+                let events = if tx_retry.is_empty() {
+                    PollFlags::IN
+                } else {
+                    PollFlags::IN | PollFlags::OUT
+                };
+                let mut pfds = [PollFd::new(&tap_fd, events)];
                 let _ = poll(&mut pfds, Some(&ts));
 
-                // Drain all pending Ethernet frames from the kernel TAP device
-                loop {
-                    match read(&tap_fd, &mut rx_buf) {
-                        Ok(0) => return self.stats,
-                        Ok(n) => self.ingest_guest_frame(rx_buf[..n].to_vec()),
-                        Err(Errno::AGAIN | Errno::INTR) => break,
-                        Err(_) => return self.stats,
+                // Drain up to 64 Ethernet frames per tick when outbound backpressure allows,
+                // so a guest packet flood cannot starve `self.poll()` or drop outbound frames.
+                if tx_retry.len() < 256 {
+                    for _ in 0..64 {
+                        match read(&tap_fd, &mut rx_buf) {
+                            Ok(0) => return self.stats,
+                            Ok(n) => self.ingest_guest_frame(rx_buf[..n].to_vec()),
+                            Err(Errno::AGAIN | Errno::INTR) => break,
+                            Err(_) => return self.stats,
+                        }
                     }
                 }
 
                 let now_ms = start.elapsed().as_millis() as i64;
                 self.poll(now_ms);
 
-                // Flush all outbound Ethernet frames back into the kernel TAP device
-                while let Some(frame) = self.next_host_frame() {
-                    let _ = write(&tap_fd, &frame);
+                // Flush outbound Ethernet frames, re-queuing on EAGAIN instead of dropping.
+                while tx_retry.len() < 256 {
+                    let Some(frame) = self.next_host_frame() else {
+                        break;
+                    };
+                    tx_retry.push_back(frame);
+                }
+                while let Some(frame) = tx_retry.front() {
+                    match write(&tap_fd, frame) {
+                        Ok(_) => {
+                            tx_retry.pop_front();
+                        }
+                        Err(Errno::AGAIN) => break,
+                        Err(Errno::INTR) => continue,
+                        Err(_) => {
+                            tx_retry.pop_front();
+                        }
+                    }
                 }
             }
             self.stats
@@ -295,19 +372,32 @@ impl SlirpBridge {
 
     fn ensure_tcp_listener(
         &mut self,
+        src_ip: Ipv4Addr,
+        src_port: u16,
         dst_ip: Ipv4Addr,
         dst_port: u16,
-        validated_domain: Option<String>,
+        validated_domains: Vec<String>,
     ) {
         // Cap concurrent TCP flows to prevent host OOM from guest SYN floods.
         const MAX_TCP_CONNS: usize = 128;
         if self.tcp_conns.len() >= MAX_TCP_CONNS {
             return;
         }
-        // Avoid duplicating an already-listening socket for the same destination
-        for c in &self.tcp_conns {
+        // Only deduplicate SYN retransmits for the exact same 4-tuple so concurrent
+        // connections to the same (dst_ip, dst_port) in the same batch each get a
+        // listening socket and are not rejected with TCP RST.
+        for c in &mut self.tcp_conns {
             let sock = self.sockets.get::<tcp::Socket>(c.handle);
-            if c.dst_ip == dst_ip && c.dst_port == dst_port && sock.state() == tcp::State::Listen {
+            if c.dst_ip == dst_ip
+                && c.dst_port == dst_port
+                && sock.state() == tcp::State::Listen
+                && c.pending_syn == Some((src_ip, src_port))
+            {
+                for d in validated_domains {
+                    if !c.validated_domains.iter().any(|e| e.eq_ignore_ascii_case(&d)) {
+                        c.validated_domains.push(d);
+                    }
+                }
                 return;
             }
         }
@@ -322,11 +412,14 @@ impl SlirpBridge {
                 handle,
                 dst_ip,
                 dst_port,
-                validated_domain,
+                pending_syn: Some((src_ip, src_port)),
+                validated_domains,
                 sni_checked: false,
                 sni_buf: Vec::new(),
                 tx_pending: VecDeque::new(),
+                guest_eof_sent: false,
                 upstream: UpstreamState::Idle,
+                last_activity: Instant::now(),
             });
         }
     }
@@ -352,45 +445,79 @@ impl SlirpBridge {
                     immediate_replies.push((meta, build_dns_a_response(data, &q, &[])));
                     continue;
                 }
-                // Offload blocking host DNS resolution to a background worker so the
-                // SlirpBridge poll loop is never stalled by slow upstream resolvers!
+                // Offload blocking host DNS resolution to a bounded background worker so the
+                // SlirpBridge poll loop is never stalled and a guest flood cannot exhaust threads.
+                if self.bg_workers.load(Ordering::Relaxed) >= MAX_BG_WORKERS {
+                    immediate_replies.push((meta, build_dns_refused(data, &q)));
+                    continue;
+                }
+                self.bg_workers.fetch_add(1, Ordering::Relaxed);
+                let guard = WorkerGuard(Arc::clone(&self.bg_workers));
                 let raw_query = data.to_vec();
+                let fallback_refused = build_dns_refused(data, &q);
                 let policy = self.policy.clone();
                 let tx = self.dns_tx.clone();
-                thread::spawn(move || {
-                    let mut allowed_v4 = Vec::new();
-                    if let Ok(addrs) = (q.qname.as_str(), 0u16).to_socket_addrs() {
-                        for sa in addrs {
-                            if let IpAddr::V4(v4) = sa.ip()
-                                && (!policy.block_private_ips
-                                    || !crate::policy::is_private_or_metadata(IpAddr::V4(v4)))
-                            {
-                                allowed_v4.push(v4);
+                let spawned = thread::Builder::new()
+                    .name("rsb-slirp-dns".into())
+                    .spawn(move || {
+                        let _guard = guard;
+                        let mut allowed_v4 = Vec::new();
+                        if let Ok(addrs) = (q.qname.as_str(), 0u16).to_socket_addrs() {
+                            for sa in addrs {
+                                if let IpAddr::V4(v4) = sa.ip()
+                                    && (!policy.block_private_ips
+                                        || !crate::policy::is_private_or_metadata(IpAddr::V4(v4)))
+                                {
+                                    allowed_v4.push(v4);
+                                }
                             }
                         }
-                    }
-                    let response_bytes = if allowed_v4.is_empty() {
-                        build_dns_refused(&raw_query, &q)
-                    } else {
-                        build_dns_a_response(&raw_query, &q, &allowed_v4)
-                    };
-                    let _ = tx.send(AsyncDnsReply {
-                        meta,
-                        qname: q.qname,
-                        resolved_ips: allowed_v4,
-                        response_bytes,
+                        let response_bytes = if allowed_v4.is_empty() {
+                            build_dns_refused(&raw_query, &q)
+                        } else {
+                            build_dns_a_response(&raw_query, &q, &allowed_v4)
+                        };
+                        let _ = tx.send(AsyncDnsReply {
+                            meta,
+                            qname: q.qname,
+                            resolved_ips: allowed_v4,
+                            response_bytes,
+                        });
                     });
-                });
+                if spawned.is_err() {
+                    immediate_replies.push((meta, fallback_refused));
+                }
             }
         }
 
-        // Drain completed async DNS lookups and update `dns_cache` (bounded anti-OOM cap)
+        // Drain completed async DNS lookups and update multi-domain TTL `dns_cache`
+        let now = Instant::now();
+        let expires = now + DNS_CACHE_TTL;
         while let Ok(reply) = self.dns_rx.try_recv() {
             if self.dns_cache.len() >= 1024 {
-                self.dns_cache.clear();
+                self.dns_cache.retain(|_, entries| {
+                    entries.retain(|(_, exp)| *exp > now);
+                    !entries.is_empty()
+                });
+                if self.dns_cache.len() >= 1024
+                    && let Some(oldest_ip) = self
+                        .dns_cache
+                        .iter()
+                        .min_by_key(|(_, entries)| {
+                            entries.iter().map(|(_, exp)| *exp).max().unwrap_or(now)
+                        })
+                        .map(|(&ip, _)| ip)
+                {
+                    self.dns_cache.remove(&oldest_ip);
+                }
             }
             for ip in reply.resolved_ips {
-                self.dns_cache.insert(ip, reply.qname.clone());
+                let entries = self.dns_cache.entry(ip).or_default();
+                entries.retain(|(d, exp)| *exp > now && !d.eq_ignore_ascii_case(&reply.qname));
+                if entries.len() >= 16 {
+                    entries.remove(0);
+                }
+                entries.push((reply.qname.clone(), expires));
             }
             immediate_replies.push((reply.meta, reply.response_bytes));
         }
@@ -404,6 +531,12 @@ impl SlirpBridge {
     fn relay_tcp_streams(&mut self) {
         let mut to_remove = Vec::new();
         let mut tmp = [0u8; 4096];
+        let now = Instant::now();
+
+        if now.duration_since(self.egress_window_start) >= Duration::from_secs(1) {
+            self.egress_window_start = now;
+            self.egress_window_bytes = 0;
+        }
 
         for (idx, conn) in self.tcp_conns.iter_mut().enumerate() {
             let sock = self.sockets.get_mut::<tcp::Socket>(conn.handle);
@@ -414,16 +547,25 @@ impl SlirpBridge {
                 continue;
             }
 
+            // Evict lingering half-open / idle sockets to prevent resource exhaustion
+            if now.duration_since(conn.last_activity) > CONN_IDLE_TIMEOUT {
+                sock.abort();
+                conn.upstream = UpstreamState::Closed;
+                continue;
+            }
+
             // 1. Poll any in-flight non-blocking upstream TCP connect
             if let UpstreamState::Connecting(ref rx) = conn.upstream {
                 match rx.try_recv() {
                     Ok(Ok(stream)) => {
                         let _ = stream.set_nonblocking(true);
                         conn.upstream = UpstreamState::Connected(stream);
+                        conn.last_activity = now;
                     }
                     Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                        // Let the next `iface.poll()` emit TCP RST before reaping on Closed
                         sock.abort();
-                        to_remove.push(idx);
+                        conn.upstream = UpstreamState::Closed;
                         continue;
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
@@ -431,10 +573,12 @@ impl SlirpBridge {
             }
 
             // 2. Guest -> Host relay (bounded `tx_pending` for TCP backpressure, plus
-            //    TLS ClientHello SNI verification up to 16,389B on port 443 and any TLS port)
+            //    TLS ClientHello SNI verification up to MAX_CLIENT_HELLO_BYTES on port 443 and any TLS port)
             const MAX_TX_PENDING: usize = 64 * 1024;
-            const MAX_CLIENT_HELLO_BYTES: usize = 16_384 + 5;
-            if sock.can_recv() && conn.tx_pending.len() < MAX_TX_PENDING {
+            if !matches!(conn.upstream, UpstreamState::Closed)
+                && sock.can_recv()
+                && conn.tx_pending.len() < MAX_TX_PENDING
+            {
                 let recv_bytes: Vec<u8> = sock
                     .recv(|buf| {
                         let copy = buf.to_vec();
@@ -443,13 +587,15 @@ impl SlirpBridge {
                     .unwrap_or_default();
 
                 if !recv_bytes.is_empty() {
+                    conn.last_activity = now;
                     let needs_sni = !conn.sni_checked
                         && self.policy.verify_tls_sni
-                        && conn.validated_domain.is_some();
+                        && !conn.validated_domains.is_empty();
 
                     if needs_sni {
                         conn.sni_buf.extend_from_slice(&recv_bytes);
-                        let is_tls = conn.sni_buf[0] == 0x16;
+                        let is_tls = conn.sni_buf[0] == 0x16
+                            && (conn.sni_buf.len() < 2 || conn.sni_buf[1] == 0x03);
                         let ready = conn.sni_buf.len() >= MAX_CLIENT_HELLO_BYTES
                             || !is_tls
                             || tls_record_expected_len(&conn.sni_buf)
@@ -461,21 +607,21 @@ impl SlirpBridge {
                                 && conn.sni_buf[0] == 0x16
                                 && conn.sni_buf[1] == 0x03;
                             if conn.dst_port == 443 || is_tls_handshake {
-                                let expected = conn.validated_domain.as_deref().unwrap_or("");
                                 let valid = match extract_tls_sni(&conn.sni_buf) {
                                     Some(ref sni) => {
-                                        sni.eq_ignore_ascii_case(expected.trim_end_matches('.'))
-                                            && self
-                                                .policy
-                                                .check_domain(sni, Some(conn.dst_port))
-                                                .is_allowed()
+                                        conn.validated_domains.iter().any(|expected| {
+                                            sni.eq_ignore_ascii_case(expected.trim_end_matches('.'))
+                                        }) && self
+                                            .policy
+                                            .check_domain(sni, Some(conn.dst_port))
+                                            .is_allowed()
                                     }
                                     None => false,
                                 };
                                 if !valid {
                                     self.stats.sni_blocked += 1;
                                     sock.abort();
-                                    to_remove.push(idx);
+                                    conn.upstream = UpstreamState::Closed;
                                     continue;
                                 }
                             }
@@ -488,11 +634,26 @@ impl SlirpBridge {
                 }
             }
 
-            // 3. Initiate async upstream connect once SNI check passed & we have bytes to send
-            if conn.sni_checked
-                && !conn.tx_pending.is_empty()
-                && matches!(conn.upstream, UpstreamState::Idle)
-            {
+            // 3. Initiate async upstream connect:
+            //    - On port 443 with SNI enforcement, wait for ClientHello SNI check first.
+            //    - On all other ports (or without SNI), connect immediately on Established/CloseWait
+            //      so server-speaks-first protocols (SSH, SMTP, IMAP, MySQL) never deadlock,
+            //      while step 2 still enforces SNI on the first guest->host bytes if TLS is spoken.
+            let wait_for_sni = conn.dst_port == 443
+                && self.policy.verify_tls_sni
+                && !conn.validated_domains.is_empty();
+            let ready_to_connect = if wait_for_sni {
+                conn.sni_checked && !conn.tx_pending.is_empty()
+            } else {
+                matches!(sock.state(), tcp::State::Established | tcp::State::CloseWait)
+            };
+            if ready_to_connect && matches!(conn.upstream, UpstreamState::Idle) {
+                if self.bg_workers.load(Ordering::Relaxed) >= MAX_BG_WORKERS {
+                    continue;
+                }
+                self.bg_workers.fetch_add(1, Ordering::Relaxed);
+                let guard = WorkerGuard(Arc::clone(&self.bg_workers));
+
                 #[cfg(test)]
                 let addr = self
                     .upstream_override
@@ -501,34 +662,68 @@ impl SlirpBridge {
                 let addr = SocketAddr::new(IpAddr::V4(conn.dst_ip), conn.dst_port);
 
                 let (tx, rx) = mpsc::channel();
-                thread::spawn(move || {
-                    let _ = tx.send(TcpStream::connect_timeout(&addr, Duration::from_secs(3)));
-                });
-                conn.upstream = UpstreamState::Connecting(rx);
+                let spawned = thread::Builder::new()
+                    .name("rsb-slirp-tcp".into())
+                    .spawn(move || {
+                        let _guard = guard;
+                        let _ = tx.send(TcpStream::connect_timeout(&addr, Duration::from_secs(3)));
+                    });
+                if spawned.is_ok() {
+                    conn.upstream = UpstreamState::Connecting(rx);
+                } else {
+                    sock.abort();
+                    conn.upstream = UpstreamState::Closed;
+                }
             }
 
-            // 4. Flush pending guest->host bytes to non-blocking upstream (handles WouldBlock!)
+            // 4. Flush pending guest->host bytes (with optional egress bandwidth throttle)
             if let UpstreamState::Connected(ref mut up) = conn.upstream {
                 while !conn.tx_pending.is_empty() {
+                    if let Some(cap) = self.policy.max_egress_bps
+                        && self.egress_window_bytes >= cap
+                    {
+                        break;
+                    }
                     let (front, _) = conn.tx_pending.as_slices();
-                    match up.write(front) {
+                    let to_write = if let Some(cap) = self.policy.max_egress_bps {
+                        let rem = usize::try_from(cap.saturating_sub(self.egress_window_bytes))
+                            .unwrap_or(usize::MAX);
+                        &front[..front.len().min(rem.max(1))]
+                    } else {
+                        front
+                    };
+                    match up.write(to_write) {
                         Ok(0) => {
                             sock.close();
                             conn.tx_pending.clear();
+                            conn.upstream = UpstreamState::Closed;
                             break;
                         }
                         Ok(n) => {
                             conn.tx_pending.drain(..n);
+                            self.egress_window_bytes = self.egress_window_bytes.saturating_add(n as u64);
+                            conn.last_activity = now;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => {
                             sock.close();
                             conn.tx_pending.clear();
+                            conn.upstream = UpstreamState::Closed;
                             break;
                         }
                     }
                 }
+            }
+
+            // Propagate guest half-close (FIN / CloseWait) to upstream once pending writes drain
+            if sock.state() == tcp::State::CloseWait
+                && conn.tx_pending.is_empty()
+                && !conn.guest_eof_sent
+                && let UpstreamState::Connected(ref mut up) = conn.upstream
+            {
+                let _ = up.shutdown(Shutdown::Write);
+                conn.guest_eof_sent = true;
             }
 
             // 5. Host -> Guest relay: cap `up.read` to smoltcp's free TX capacity so
@@ -542,15 +737,16 @@ impl SlirpBridge {
                     match up.read(&mut tmp[..max_read]) {
                         Ok(0) => {
                             sock.close();
-                            conn.upstream = UpstreamState::Idle;
+                            conn.upstream = UpstreamState::Closed;
                         }
                         Ok(n) => {
                             let _ = sock.send_slice(&tmp[..n]);
+                            conn.last_activity = now;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                         Err(_) => {
                             sock.abort();
-                            conn.upstream = UpstreamState::Idle;
+                            conn.upstream = UpstreamState::Closed;
                         }
                     }
                 }
@@ -591,8 +787,8 @@ impl Drop for SlirpHandle {
 }
 
 /// Inspect a raw Ethernet frame; if it is an IPv4 TCP `SYN` (without `ACK`),
-/// return `Some((dst_ip, dst_port))`.
-fn inspect_tcp_syn(frame: &[u8]) -> Option<(Ipv4Addr, u16)> {
+/// return `Some((src_ip, src_port, dst_ip, dst_port))`.
+fn inspect_tcp_syn(frame: &[u8]) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16)> {
     let eth = EthernetFrame::new_checked(frame).ok()?;
     if eth.ethertype() != EthernetProtocol::Ipv4 {
         return None;
@@ -603,7 +799,12 @@ fn inspect_tcp_syn(frame: &[u8]) -> Option<(Ipv4Addr, u16)> {
     }
     let tcp_pkt = TcpPacket::new_checked(ipv4.payload()).ok()?;
     if tcp_pkt.syn() && !tcp_pkt.ack() {
-        return Some((ipv4.dst_addr(), tcp_pkt.dst_port()));
+        return Some((
+            ipv4.src_addr(),
+            tcp_pkt.src_port(),
+            ipv4.dst_addr(),
+            tcp_pkt.dst_port(),
+        ));
     }
     None
 }

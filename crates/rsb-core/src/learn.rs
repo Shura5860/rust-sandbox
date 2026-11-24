@@ -10,37 +10,108 @@ use crate::policy::SandboxBuilder;
 use crate::profile::SandboxProfile;
 use rsb_sys::clone3::{CloneArgs, CloneResult, SIGCHLD, clone3};
 use rsb_sys::ptrace::{
-    self, PTRACE_O_EXITKILL, PTRACE_O_TRACECLONE, PTRACE_O_TRACEFORK, PTRACE_O_TRACESYSGOOD,
-    PTRACE_O_TRACEVFORK,
+    self, PTRACE_O_EXITKILL, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK,
+    PTRACE_O_TRACESYSGOOD, PTRACE_O_TRACEVFORK,
 };
 use rsb_sys::rustix::io::Errno;
-use rsb_sys::rustix::process::{
-    Pid, Signal, WaitOptions, getpid, kill_process, setpgid, waitpgid, waitpid,
-};
+use rsb_sys::rustix::process::{Pid, Signal, WaitOptions, getpid, kill_process, setpgid, waitpid};
 use rsb_sys::{RawErrno, execve_raw, exit_group};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-// x86_64 syscall numbers monitored for filesystem & network policy synthesis
+// Architecture-specific syscall numbers monitored for filesystem & network policy synthesis
 #[cfg(target_arch = "x86_64")]
 mod trace_nr {
     pub const OPEN: u32 = 2;
     pub const SOCKET: u32 = 41;
     pub const EXECVE: u32 = 59;
+    pub const TRUNCATE: u32 = 76;
     pub const RENAME: u32 = 82;
     pub const MKDIR: u32 = 83;
+    pub const RMDIR: u32 = 84;
     pub const CREAT: u32 = 85;
+    pub const LINK: u32 = 86;
     pub const UNLINK: u32 = 87;
+    pub const SYMLINK: u32 = 88;
+    pub const CHMOD: u32 = 90;
     pub const OPENAT: u32 = 257;
     pub const MKDIRAT: u32 = 258;
     pub const UNLINKAT: u32 = 263;
     pub const RENAMEAT: u32 = 264;
     pub const LINKAT: u32 = 265;
     pub const SYMLINKAT: u32 = 266;
+    pub const FCHMODAT: u32 = 268;
     pub const RENAMEAT2: u32 = 316;
+    pub const EXECVEAT: u32 = 322;
     pub const OPENAT2: u32 = 437;
+}
+
+#[cfg(target_arch = "aarch64")]
+mod trace_nr {
+    pub const MKDIRAT: u32 = 34;
+    pub const UNLINKAT: u32 = 35;
+    pub const SYMLINKAT: u32 = 36;
+    pub const LINKAT: u32 = 37;
+    pub const RENAMEAT: u32 = 38;
+    pub const TRUNCATE: u32 = 45;
+    pub const FCHMODAT: u32 = 53;
+    pub const OPENAT: u32 = 56;
+    pub const SOCKET: u32 = 198;
+    pub const EXECVE: u32 = 221;
+    pub const RENAMEAT2: u32 = 276;
+    pub const EXECVEAT: u32 = 281;
+    pub const OPENAT2: u32 = 437;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn reg_nr(r: &ptrace::UserRegs) -> u32 { r.orig_rax as u32 }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn reg_nr(r: &ptrace::UserRegs) -> u32 { r.regs[8] as u32 }
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn reg_arg0(r: &ptrace::UserRegs) -> u64 { r.rdi }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn reg_arg0(r: &ptrace::UserRegs) -> u64 { r.regs[0] }
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn reg_arg1(r: &ptrace::UserRegs) -> u64 { r.rsi }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn reg_arg1(r: &ptrace::UserRegs) -> u64 { r.regs[1] }
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn reg_arg2(r: &ptrace::UserRegs) -> u64 { r.rdx }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn reg_arg2(r: &ptrace::UserRegs) -> u64 { r.regs[2] }
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn reg_arg3(r: &ptrace::UserRegs) -> u64 { r.r10 }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn reg_arg3(r: &ptrace::UserRegs) -> u64 { r.regs[3] }
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn reg_ret(r: &ptrace::UserRegs) -> i64 { r.rax as i64 }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn reg_ret(r: &ptrace::UserRegs) -> i64 { r.regs[0] as i64 }
+
+#[derive(Default)]
+struct PendingSyscall {
+    read: Vec<PathBuf>,
+    write: Vec<PathBuf>,
+    net: bool,
 }
 
 const AT_FDCWD: i32 = -100;
@@ -64,7 +135,6 @@ pub struct LearnReport {
 }
 
 /// Run `program` with `args` under `ptrace` observation and synthesize a tight `SandboxProfile`.
-#[cfg(target_arch = "x86_64")]
 pub fn learn_policy<I, S>(program: impl Into<PathBuf>, args: I) -> Result<LearnReport, SandboxError>
 where
     I: IntoIterator<Item = S>,
@@ -78,7 +148,6 @@ where
 /// When `strict_allowlist` is `true`, the generated `SandboxProfile` includes
 /// `[seccomp] mode = "allowlist"` with the exact set of observed syscall numbers
 /// (all unlisted syscalls are rejected by the kernel with `EPERM`).
-#[cfg(target_arch = "x86_64")]
 pub fn learn_policy_with_options<I, S>(
     program: impl Into<PathBuf>,
     args: I,
@@ -148,7 +217,6 @@ where
         }
     }
 
-    const PTRACE_O_TRACEEXEC: usize = 0x0000_0010;
     let opts = PTRACE_O_TRACESYSGOOD
         | PTRACE_O_TRACEFORK
         | PTRACE_O_TRACEVFORK
@@ -179,34 +247,96 @@ where
     let mut root_exit_code: Option<i32> = None;
 
     // Track whether each traced TID is currently on syscall-entry vs syscall-exit,
-    // and which TIDs have already passed their initial kernel `SIGSTOP` after fork/clone.
+    // which TIDs have passed their initial kernel `SIGSTOP`, pending entry observations
+    // (committed only when `ret >= 0`), pending exec paths (committed on `PTRACE_EVENT_EXEC`),
+    // and the exact set of tracked TIDs (so descendants calling `setsid()`/`setpgid()`
+    // are never missed while never stealing unrelated children in multithreaded hosts).
     let mut in_syscall: BTreeMap<i32, bool> = BTreeMap::new();
+    let mut pending_map: BTreeMap<i32, PendingSyscall> = BTreeMap::new();
+    let mut pending_exec: BTreeMap<i32, Vec<PathBuf>> = BTreeMap::new();
     let mut seen_tids: BTreeSet<i32> = BTreeSet::new();
+    let mut tracked_tids: BTreeSet<i32> = BTreeSet::new();
     seen_tids.insert(root_pid);
+    tracked_tids.insert(root_pid);
 
-    // Linux `__WALL` (0x4000_0000): wait for both cloned threads and forked children
-    // strictly inside this tracee's process group (`waitpgid(root_pid_t, __WALL)`).
+    // Linux `__WALL` (0x4000_0000): wait for both cloned threads and forked children.
     let wait_all = WaitOptions::from_bits_retain(0x4000_0000);
+    let wait_all_nohang = wait_all | WaitOptions::NOHANG;
 
     loop {
-        let wait_res = waitpgid(root_pid_t, wait_all);
-        let (tid_pid, status) = match wait_res {
-            Ok(Some(pair)) => pair,
-            Ok(None) => continue,
-            Err(Errno::CHILD) => break, // All traced processes have exited
-            Err(Errno::INTR) => continue,
-            Err(e) => {
-                return Err(SandboxError::Syscall {
-                    stage: "waitpid(learn loop)",
-                    errno: RawErrno(e.raw_os_error()),
-                });
+        if tracked_tids.is_empty() {
+            break;
+        }
+        let (tid, status) = if tracked_tids.len() == 1 {
+            let only_tid = *tracked_tids.iter().next().unwrap();
+            let Some(pid_t) = Pid::from_raw(only_tid) else {
+                tracked_tids.remove(&only_tid);
+                continue;
+            };
+            match waitpid(Some(pid_t), wait_all) {
+                Ok(Some((_, st))) => (only_tid, st),
+                Ok(None) => continue,
+                Err(Errno::CHILD) => {
+                    tracked_tids.remove(&only_tid);
+                    continue;
+                }
+                Err(Errno::INTR) => continue,
+                Err(e) => {
+                    return Err(SandboxError::Syscall {
+                        stage: "waitpid(learn loop)",
+                        errno: RawErrno(e.raw_os_error()),
+                    });
+                }
+            }
+        } else {
+            let tids_snapshot: Vec<i32> = tracked_tids.iter().copied().collect();
+            let mut found = None;
+            let mut gone = Vec::new();
+            for t in tids_snapshot {
+                let Some(pid_t) = Pid::from_raw(t) else {
+                    gone.push(t);
+                    continue;
+                };
+                match waitpid(Some(pid_t), wait_all_nohang) {
+                    Ok(Some((_, st))) => {
+                        found = Some((t, st));
+                        break;
+                    }
+                    Ok(None) | Err(Errno::INTR) => {}
+                    Err(Errno::CHILD) => gone.push(t),
+                    Err(e) => {
+                        return Err(SandboxError::Syscall {
+                            stage: "waitpid(learn loop)",
+                            errno: RawErrno(e.raw_os_error()),
+                        });
+                    }
+                }
+            }
+            for g in gone {
+                tracked_tids.remove(&g);
+                seen_tids.remove(&g);
+                in_syscall.remove(&g);
+                pending_map.remove(&g);
+                pending_exec.remove(&g);
+            }
+            match found {
+                Some(pair) => pair,
+                None => {
+                    if tracked_tids.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(250));
+                    continue;
+                }
             }
         };
-        let tid = tid_pid.as_raw_nonzero().get();
 
         if status.exited() || status.signaled() {
             in_syscall.remove(&tid);
+            pending_map.remove(&tid);
+            pending_exec.remove(&tid);
             seen_tids.remove(&tid);
+            tracked_tids.remove(&tid);
             if tid == root_pid {
                 root_exit_code = status.exit_status();
             }
@@ -221,17 +351,32 @@ where
                 let entering = !in_syscall.get(&tid).copied().unwrap_or(false);
                 in_syscall.insert(tid, entering);
 
-                if entering && let Ok(regs) = ptrace::getregs(tid) {
-                    let nr = regs.orig_rax as u32;
-                    observed_syscalls.insert(nr);
-                    inspect_syscall(
-                        tid,
-                        nr,
-                        &regs,
-                        &mut read_paths,
-                        &mut write_paths,
-                        &mut network_used,
-                    );
+                if entering {
+                    if let Ok(regs) = ptrace::getregs(tid) {
+                        let nr = reg_nr(&regs);
+                        observed_syscalls.insert(nr);
+                        let mut pending = PendingSyscall::default();
+                        inspect_syscall_entry(tid, nr, &regs, &mut pending);
+                        if nr == trace_nr::EXECVE || nr == trace_nr::EXECVEAT {
+                            if !pending.read.is_empty() {
+                                pending_exec.insert(tid, pending.read);
+                            }
+                        } else if !pending.read.is_empty() || !pending.write.is_empty() || pending.net {
+                            pending_map.insert(tid, pending);
+                        }
+                    }
+                } else {
+                    pending_exec.remove(&tid);
+                    if let Some(pending) = pending_map.remove(&tid)
+                        && let Ok(regs) = ptrace::getregs(tid)
+                        && reg_ret(&regs) >= 0
+                    {
+                        read_paths.extend(pending.read);
+                        write_paths.extend(pending.write);
+                        if pending.net {
+                            network_used = true;
+                        }
+                    }
                 }
                 let _ = ptrace::syscall_continue(tid, 0);
             } else if sig == 19 && !seen_tids.contains(&tid) {
@@ -241,10 +386,38 @@ where
                 let _ = ptrace::syscall_continue(tid, 0);
             } else if sig == 5 && ptrace_event != 0 {
                 // Real ptrace event stop (FORK=1, VFORK=2, CLONE=3, EXEC=4, EXIT=6).
-                // On PTRACE_EVENT_EXEC (4), reset `in_syscall` so entry/exit cannot desync.
                 seen_tids.insert(tid);
-                if ptrace_event == 4 {
-                    in_syscall.insert(tid, false);
+                match ptrace_event {
+                    1..=3 => {
+                        if let Ok(new_tid) = ptrace::geteventmsg(tid)
+                            && new_tid > 0
+                        {
+                            tracked_tids.insert(new_tid as i32);
+                        }
+                    }
+                    4 => {
+                        // PTRACE_EVENT_EXEC: commit verified execve/execveat target path.
+                        // If a non-leader thread called execve, PTRACE_GETEVENTMSG returns
+                        // its former TID while the surviving thread takes the leader's PID.
+                        if let Some(paths) = pending_exec.remove(&tid) {
+                            read_paths.extend(paths);
+                        }
+                        if let Ok(old_tid_u64) = ptrace::geteventmsg(tid) {
+                            let old_tid = old_tid_u64 as i32;
+                            if old_tid > 0 && old_tid != tid {
+                                if let Some(paths) = pending_exec.remove(&old_tid) {
+                                    read_paths.extend(paths);
+                                }
+                                in_syscall.remove(&old_tid);
+                                pending_map.remove(&old_tid);
+                                seen_tids.remove(&old_tid);
+                                tracked_tids.remove(&old_tid);
+                            }
+                        }
+                        // Ensure the upcoming execve syscall-exit stop pairs cleanly.
+                        in_syscall.insert(tid, true);
+                    }
+                    _ => {}
                 }
                 let _ = ptrace::syscall_continue(tid, 0);
             } else {
@@ -272,91 +445,118 @@ where
     })
 }
 
-#[cfg(target_arch = "x86_64")]
-fn inspect_syscall(
+fn inspect_syscall_entry(
     tid: i32,
     nr: u32,
     regs: &ptrace::UserRegs,
-    read_paths: &mut BTreeSet<PathBuf>,
-    write_paths: &mut BTreeSet<PathBuf>,
-    network_used: &mut bool,
+    pending: &mut PendingSyscall,
 ) {
+    let a0 = reg_arg0(regs);
+    let a1 = reg_arg1(regs);
+    let a2 = reg_arg2(regs);
+    let a3 = reg_arg3(regs);
+
     match nr {
         trace_nr::OPENAT => {
-            let dirfd = regs.rdi as i32;
-            let flags = regs.rdx;
-            if let Some(path) = read_and_resolve_path(tid, dirfd, regs.rsi) {
+            let dirfd = a0 as i32;
+            let flags = a2;
+            if let Some(path) = read_and_resolve_path(tid, dirfd, a1) {
                 if is_write_flags(flags) {
-                    write_paths.insert(path);
+                    pending.write.push(path);
                 } else {
-                    read_paths.insert(path);
+                    pending.read.push(path);
                 }
             }
         }
         trace_nr::OPENAT2 => {
-            let dirfd = regs.rdi as i32;
-            // `open_how.flags` is the first u64 at `regs.rdx`
-            let flags = ptrace::peekdata(tid, regs.rdx as usize).unwrap_or(0) as u64;
-            if let Some(path) = read_and_resolve_path(tid, dirfd, regs.rsi) {
-                if is_write_flags(flags) {
-                    write_paths.insert(path);
-                } else {
-                    read_paths.insert(path);
+            let dirfd = a0 as i32;
+            if let Ok(flags_word) = ptrace::peekdata(tid, a2 as usize) {
+                let flags = flags_word as u64;
+                if let Some(path) = read_and_resolve_path(tid, dirfd, a1) {
+                    if is_write_flags(flags) {
+                        pending.write.push(path);
+                    } else {
+                        pending.read.push(path);
+                    }
                 }
             }
         }
+        #[cfg(target_arch = "x86_64")]
         trace_nr::OPEN => {
-            let flags = regs.rsi;
-            if let Some(path) = read_and_resolve_path(tid, AT_FDCWD, regs.rdi) {
+            let flags = a1;
+            if let Some(path) = read_and_resolve_path(tid, AT_FDCWD, a0) {
                 if is_write_flags(flags) {
-                    write_paths.insert(path);
+                    pending.write.push(path);
                 } else {
-                    read_paths.insert(path);
+                    pending.read.push(path);
                 }
             }
         }
-        trace_nr::CREAT | trace_nr::MKDIR | trace_nr::UNLINK => {
-            if let Some(path) = read_and_resolve_path(tid, AT_FDCWD, regs.rdi) {
-                write_paths.insert(path);
+        #[cfg(target_arch = "x86_64")]
+        trace_nr::CREAT
+        | trace_nr::MKDIR
+        | trace_nr::RMDIR
+        | trace_nr::UNLINK
+        | trace_nr::CHMOD => {
+            if let Some(path) = read_and_resolve_path(tid, AT_FDCWD, a0) {
+                pending.write.push(path);
             }
         }
-        trace_nr::RENAME => {
-            if let Some(p) = read_and_resolve_path(tid, AT_FDCWD, regs.rdi) {
-                write_paths.insert(p);
+        #[cfg(target_arch = "x86_64")]
+        trace_nr::RENAME | trace_nr::LINK => {
+            if let Some(p) = read_and_resolve_path(tid, AT_FDCWD, a0) {
+                pending.write.push(p);
             }
-            if let Some(p) = read_and_resolve_path(tid, AT_FDCWD, regs.rsi) {
-                write_paths.insert(p);
+            if let Some(p) = read_and_resolve_path(tid, AT_FDCWD, a1) {
+                pending.write.push(p);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        trace_nr::SYMLINK => {
+            if let Some(p) = read_and_resolve_path(tid, AT_FDCWD, a1) {
+                pending.write.push(p);
+            }
+        }
+        trace_nr::TRUNCATE => {
+            if let Some(path) = read_and_resolve_path(tid, AT_FDCWD, a0) {
+                pending.write.push(path);
             }
         }
         trace_nr::EXECVE => {
-            if let Some(path) = read_and_resolve_path(tid, AT_FDCWD, regs.rdi) {
-                read_paths.insert(path);
+            if let Some(path) = read_and_resolve_path(tid, AT_FDCWD, a0) {
+                pending.read.push(path);
             }
         }
-        trace_nr::MKDIRAT | trace_nr::UNLINKAT => {
-            let dirfd = regs.rdi as i32;
-            if let Some(path) = read_and_resolve_path(tid, dirfd, regs.rsi) {
-                write_paths.insert(path);
+        trace_nr::EXECVEAT => {
+            let dirfd = a0 as i32;
+            if let Some(path) = read_and_resolve_path(tid, dirfd, a1) {
+                pending.read.push(path);
+            }
+        }
+        trace_nr::MKDIRAT | trace_nr::UNLINKAT | trace_nr::FCHMODAT => {
+            let dirfd = a0 as i32;
+            if let Some(path) = read_and_resolve_path(tid, dirfd, a1) {
+                pending.write.push(path);
             }
         }
         trace_nr::SYMLINKAT => {
-            let newdirfd = regs.rsi as i32;
-            if let Some(path) = read_and_resolve_path(tid, newdirfd, regs.rdx) {
-                write_paths.insert(path);
+            let newdirfd = a1 as i32;
+            if let Some(path) = read_and_resolve_path(tid, newdirfd, a2) {
+                pending.write.push(path);
             }
         }
         trace_nr::RENAMEAT | trace_nr::RENAMEAT2 | trace_nr::LINKAT => {
-            let old_dirfd = regs.rdi as i32;
-            let new_dirfd = regs.rdx as i32;
-            if let Some(p) = read_and_resolve_path(tid, old_dirfd, regs.rsi) {
-                write_paths.insert(p);
+            let old_dirfd = a0 as i32;
+            let new_dirfd = a2 as i32;
+            if let Some(p) = read_and_resolve_path(tid, old_dirfd, a1) {
+                pending.write.push(p);
             }
-            if let Some(p) = read_and_resolve_path(tid, new_dirfd, regs.r10) {
-                write_paths.insert(p);
+            if let Some(p) = read_and_resolve_path(tid, new_dirfd, a3) {
+                pending.write.push(p);
             }
         }
-        trace_nr::SOCKET if regs.rdi == AF_INET || regs.rdi == AF_INET6 => {
-            *network_used = true;
+        trace_nr::SOCKET if a0 == AF_INET || a0 == AF_INET6 => {
+            pending.net = true;
         }
         _ => {}
     }
@@ -381,6 +581,9 @@ fn read_and_resolve_path(tid: i32, dirfd: i32, addr: u64) -> Option<PathBuf> {
     } else {
         std::fs::read_link(format!("/proc/{tid}/fd/{dirfd}")).ok()?
     };
+    if base.as_os_str().as_bytes().ends_with(b" (deleted)") {
+        return None;
+    }
     Some(clean_path(&base.join(raw)))
 }
 
@@ -410,17 +613,45 @@ fn synthesize_profile(
         ..Default::default()
     };
 
+    const NO_PROMOTE_DIRS: &[&str] = &["/", "/etc", "/var", "/dev", "/run", "/home"];
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+    let is_broad_dir = |dir: &Path| -> bool {
+        NO_PROMOTE_DIRS.iter().any(|&d| dir == Path::new(d))
+            || home_dir.as_deref() == Some(dir)
+    };
+    let coalesce_target = |p: &Path| -> PathBuf {
+        if p.is_dir() {
+            return p.to_path_buf();
+        }
+        match p.parent() {
+            Some(parent) if !is_broad_dir(parent) => parent.to_path_buf(),
+            _ => p.to_path_buf(),
+        }
+    };
+
     let mut rw_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     for p in write_paths {
         if is_ignored_or_system_path(p) {
             continue;
         }
-        let dir = if p.is_dir() {
-            p.clone()
+        let target = coalesce_target(p);
+        if target.exists() {
+            rw_dirs.insert(target);
         } else {
-            p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.clone())
-        };
-        rw_dirs.insert(dir);
+            // Walk up to the nearest existing non-broad ancestor (e.g. deleted temp files)
+            // so the generated profile never fails Landlock `stat()` with ENOENT.
+            let mut cur = target.parent();
+            while let Some(anc) = cur {
+                if is_broad_dir(anc) {
+                    break;
+                }
+                if anc.exists() {
+                    rw_dirs.insert(anc.to_path_buf());
+                    break;
+                }
+                cur = anc.parent();
+            }
+        }
     }
 
     let mut ro_dirs: BTreeSet<PathBuf> = BTreeSet::new();
@@ -432,12 +663,7 @@ fn synthesize_profile(
         if rw_dirs.iter().any(|rw| p.starts_with(rw)) {
             continue;
         }
-        let target = if p.is_dir() {
-            p.clone()
-        } else {
-            p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.clone())
-        };
-        ro_dirs.insert(target);
+        ro_dirs.insert(coalesce_target(p));
     }
 
     profile.ro = ro_dirs.into_iter().collect();

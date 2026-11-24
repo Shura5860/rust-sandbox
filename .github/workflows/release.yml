@@ -7,24 +7,36 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release-linux-x86_64:
-    runs-on: ubuntu-latest
+    # Build on Ubuntu 22.04 (glibc 2.35) for broad librsb_ffi.so compatibility,
+    # and build the standalone `rsb` CLI statically with `x86_64-unknown-linux-musl`.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain & musl target
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
-      - name: Allow unprivileged userns capabilities on Ubuntu 24.04 runners
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Enable unprivileged userns if restricted by AppArmor
+        run: |
+          if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
       - name: Verify tag matches Cargo.toml version
         run: |
           TAG_VER="${GITHUB_REF_NAME#v}"
           CARGO_VER="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
-          if [[ "${TAG_VER}" != "${CARGO_VER}"* ]]; then
+          if [[ ! "${TAG_VER}" =~ ^${CARGO_VER//./\\.}(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VER}" >&2
             exit 1
           fi
@@ -32,22 +44,31 @@ jobs:
       - name: Run test suite
         run: cargo test --workspace
 
-      - name: Build release artifacts
-        run: cargo build --workspace --release
+      - name: Build static musl CLI & portable librsb_ffi.so (with SONAME)
+        run: |
+          cargo build -p rsb-cli --release --target x86_64-unknown-linux-musl
+          RUSTFLAGS="-C link-arg=-Wl,-soname,librsb_ffi.so.0" cargo build -p rsb-ffi --release
 
       - name: Package & smoke-test release archive
         run: |
           TAG="${GITHUB_REF_NAME}"
-          PKG="rust-sandbox-${TAG}-x86_64-unknown-linux-gnu"
+          PKG="rust-sandbox-${TAG}-x86_64-unknown-linux-musl"
           mkdir -p "dist/${PKG}/include" "dist/${PKG}/python"
-          cp target/release/rsb "dist/${PKG}/rsb"
-          cp target/release/librsb_ffi.so "dist/${PKG}/librsb_ffi.so"
+          cp target/x86_64-unknown-linux-musl/release/rsb "dist/${PKG}/rsb"
+          cp target/release/librsb_ffi.so "dist/${PKG}/librsb_ffi.so.0"
+          ln -s librsb_ffi.so.0 "dist/${PKG}/librsb_ffi.so"
           cp bindings/c/rsb.h "dist/${PKG}/include/rsb.h"
           cp bindings/python/rsb.py "dist/${PKG}/python/rsb.py"
-          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${PKG}/"
+          cp bindings/python/pyproject.toml "dist/${PKG}/python/pyproject.toml"
+          cp README.md ARCHITECTURE.md SECURITY.md LICENSE-MIT LICENSE-APACHE "dist/${PKG}/"
           "dist/${PKG}/rsb" info
           python3 "dist/${PKG}/python/rsb.py"
           (cd dist && tar -czf "${PKG}.tar.gz" "${PKG}" && sha256sum "${PKG}.tar.gz" > SHA256SUMS.txt)
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.tar.gz"
 
       - name: Publish GitHub Release
         env:
@@ -59,7 +80,7 @@ jobs:
             EXTRA_FLAGS="--prerelease"
           fi
           gh release create "${TAG}" \
-            "dist/rust-sandbox-${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
+            "dist/rust-sandbox-${TAG}-x86_64-unknown-linux-musl.tar.gz" \
             "dist/SHA256SUMS.txt" \
             --title "rust-sandbox ${TAG}" \
             --generate-notes ${EXTRA_FLAGS}

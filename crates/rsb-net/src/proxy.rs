@@ -6,13 +6,13 @@
 //!   to prevent shared-CDN host spoofing without MITM decryption.
 
 use crate::policy::EgressPolicy;
-use crate::sni::{extract_tls_sni, tls_record_expected_len};
+use crate::sni::{MAX_CLIENT_HELLO_BYTES, extract_tls_sni, tls_record_expected_len};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_CONCURRENT_CONNS: usize = 128;
 const MAX_HEADER_LINE_BYTES: usize = 4096;
@@ -56,10 +56,15 @@ impl EgressProxy {
                         }
                         let slot = ConnSlot(Arc::clone(&active_conns));
                         let pol = Arc::clone(&policy);
-                        thread::spawn(move || {
-                            let _slot = slot;
-                            let _ = handle_client(stream, &pol);
-                        });
+                        let spawned = thread::Builder::new()
+                            .name("rsb-proxy-conn".into())
+                            .spawn(move || {
+                                let _slot = slot;
+                                let _ = handle_client(stream, &pol);
+                            });
+                        if spawned.is_err() {
+                            // `slot` drops automatically here, freeing the connection slot.
+                        }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -108,14 +113,18 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
     let _ = client.set_nonblocking(false);
     // Enforce an absolute wall-clock deadline across the entire HTTP header read phase
     // so a slowloris client trickling 1 byte every 9s cannot hold connection slots for days.
-    let header_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let header_deadline = Instant::now() + Duration::from_secs(10);
     let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = client.set_write_timeout(Some(Duration::from_secs(10)));
 
     let mut reader = BufReader::new(client.try_clone()?);
     let mut request_line = String::new();
-    match read_bounded_line(&mut reader, &mut request_line, MAX_HEADER_LINE_BYTES)? {
+    match read_bounded_line(&mut reader, &mut request_line, MAX_HEADER_LINE_BYTES, header_deadline)? {
         BoundedLine::Eof => return Ok(()),
+        BoundedLine::Timeout => {
+            let _ = client.write_all(b"HTTP/1.1 408 Request Timeout\r\n\r\n");
+            return Ok(());
+        }
         BoundedLine::TooLong => {
             client.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n")?;
             return Ok(());
@@ -128,15 +137,13 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
     let mut hdr_count = 0usize;
     let mut saw_end_of_headers = false;
     loop {
-        let now = std::time::Instant::now();
-        if now >= header_deadline {
-            let _ = client.write_all(b"HTTP/1.1 408 Request Timeout\r\n\r\n");
-            return Ok(());
-        }
-        let _ = client.set_read_timeout(Some(header_deadline.saturating_duration_since(now)));
         hdr.clear();
-        match read_bounded_line(&mut reader, &mut hdr, MAX_HEADER_LINE_BYTES)? {
+        match read_bounded_line(&mut reader, &mut hdr, MAX_HEADER_LINE_BYTES, header_deadline)? {
             BoundedLine::Eof => break,
+            BoundedLine::Timeout => {
+                let _ = client.write_all(b"HTTP/1.1 408 Request Timeout\r\n\r\n");
+                return Ok(());
+            }
             BoundedLine::TooLong => {
                 client.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n")?;
                 return Ok(());
@@ -224,24 +231,26 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
         client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
         client.flush()?;
 
-        // 3. Only buffer initial client bytes BEFORE connecting upstream when TLS SNI
-        //    verification is active; otherwise connect immediately so server-speaks-first
-        //    protocols (SSH, SMTP, IMAP, MySQL) do not deadlock!
-        //    Raise the TLS ClientHello cap to RFC 8446 max single record (16,389 bytes)
-        //    so post-quantum TLS 1.3 (X25519MLKEM768) key shares are never truncated.
-        const MAX_CLIENT_HELLO_BYTES: usize = 16_384 + 5;
-        let check_sni = policy.verify_tls_sni && validated_domain.is_some();
+        // 3. Only buffer initial client bytes BEFORE connecting upstream on port 443
+        //    when TLS SNI verification is active; on non-443 ports connect upstream
+        //    immediately so server-speaks-first protocols (SSH, SMTP, IMAP, MySQL)
+        //    do not deadlock, while still inspecting first client->upstream bytes for
+        //    TLS SNI inside the client->upstream relay thread.
+        let check_sni_before_connect =
+            port == 443 && policy.verify_tls_sni && validated_domain.is_some();
         let mut first_buf = Vec::new();
-        if check_sni {
-            let sni_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        if check_sni_before_connect {
+            let sni_deadline = Instant::now() + Duration::from_secs(10);
             first_buf.reserve(512);
             let mut chunk = [0u8; 4096];
             loop {
-                let now = std::time::Instant::now();
+                let now = Instant::now();
                 if now >= sni_deadline {
                     return Ok(());
                 }
-                let _ = client.set_read_timeout(Some(sni_deadline.saturating_duration_since(now)));
+                let _ = reader
+                    .get_ref()
+                    .set_read_timeout(Some(sni_deadline.saturating_duration_since(now)));
                 let n = reader.read(&mut chunk)?;
                 if n == 0 {
                     break;
@@ -250,8 +259,8 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
                 if first_buf.len() >= MAX_CLIENT_HELLO_BYTES {
                     break;
                 }
-                // If first byte isn't TLS Handshake (0x16), stop buffering immediately
-                if first_buf[0] != 0x16 {
+                // If initial bytes are not TLS Handshake (0x16 0x03), stop buffering immediately
+                if first_buf[0] != 0x16 || (first_buf.len() >= 2 && first_buf[1] != 0x03) {
                     break;
                 }
                 if let Some(expected_len) = tls_record_expected_len(&first_buf)
@@ -264,18 +273,14 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
                 return Ok(());
             }
 
-            let is_tls_handshake = first_buf.len() >= 2 && first_buf[0] == 0x16 && first_buf[1] == 0x03;
-            // Require TLS + matching SNI on port 443, AND whenever TLS is detected on any other port!
-            if (port == 443 || is_tls_handshake)
-                && let Some(expected_host) = validated_domain
-            {
+            if let Some(expected_host) = validated_domain {
                 let expected_norm = expected_host.trim_end_matches('.');
                 match extract_tls_sni(&first_buf) {
                     Some(ref sni)
                         if sni.eq_ignore_ascii_case(expected_norm)
                             && policy.check_domain(sni, Some(port)).is_allowed() => {}
                     _ => {
-                        // SNI mismatch, ECH, or missing SNI on HTTPS/TLS tunnel -> drop immediately!
+                        // SNI mismatch, ECH, or missing SNI on HTTPS tunnel -> drop immediately!
                         return Ok(());
                     }
                 }
@@ -312,13 +317,78 @@ fn handle_client(mut client: TcpStream, policy: &EgressPolicy) -> io::Result<()>
         let mut u_read = upstream.try_clone()?;
         let mut u_write = upstream;
 
-        let t1 = thread::spawn(move || {
-            let _ = io::copy(&mut c_read, &mut u_write);
-            let _ = u_write.shutdown(std::net::Shutdown::Write);
-        });
+        let defer_sni_check = !check_sni_before_connect && policy.verify_tls_sni;
+        let expected_domain_owned = if defer_sni_check {
+            validated_domain.map(|h| h.trim_end_matches('.').to_string())
+        } else {
+            None
+        };
+        let policy_clone = if expected_domain_owned.is_some() {
+            Some(policy.clone())
+        } else {
+            None
+        };
+
+        let t1 = thread::Builder::new()
+            .name("rsb-proxy-c2u".into())
+            .spawn(move || {
+                if let (Some(expected_norm), Some(pol)) = (expected_domain_owned, policy_clone) {
+                    let mut buf = Vec::with_capacity(512);
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match c_read.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.len() >= MAX_CLIENT_HELLO_BYTES {
+                                    break;
+                                }
+                                if buf[0] != 0x16 || (buf.len() >= 2 && buf[1] != 0x03) {
+                                    break;
+                                }
+                                if let Some(expected_len) = tls_record_expected_len(&buf)
+                                    && buf.len() >= expected_len.min(MAX_CLIENT_HELLO_BYTES)
+                                {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = u_write.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        }
+                    }
+                    if buf.is_empty() {
+                        let _ = u_write.shutdown(std::net::Shutdown::Write);
+                        return;
+                    }
+                    let is_tls_handshake = buf.len() >= 2 && buf[0] == 0x16 && buf[1] == 0x03;
+                    if is_tls_handshake {
+                        let valid = match extract_tls_sni(&buf) {
+                            Some(ref sni) => {
+                                sni.eq_ignore_ascii_case(&expected_norm)
+                                    && pol.check_domain(sni, Some(port)).is_allowed()
+                            }
+                            None => false,
+                        };
+                        if !valid {
+                            let _ = u_write.shutdown(std::net::Shutdown::Both);
+                            return;
+                        }
+                    }
+                    if u_write.write_all(&buf).is_err() {
+                        let _ = u_write.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                }
+                let _ = io::copy(&mut c_read, &mut u_write);
+                let _ = u_write.shutdown(std::net::Shutdown::Write);
+            });
         let _ = io::copy(&mut u_read, &mut c_write);
         let _ = c_write.shutdown(std::net::Shutdown::Write);
-        let _ = t1.join();
+        if let Ok(h) = t1 {
+            let _ = h.join();
+        }
     } else {
         client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")?;
     }
@@ -330,16 +400,34 @@ enum BoundedLine {
     Ok,
     Eof,
     TooLong,
+    Timeout,
 }
 
-fn read_bounded_line<R: BufRead>(
-    reader: &mut R,
+fn read_bounded_line(
+    reader: &mut BufReader<TcpStream>,
     out: &mut String,
     max_bytes: usize,
+    deadline: Instant,
 ) -> io::Result<BoundedLine> {
     let mut total = 0usize;
     loop {
-        let avail = reader.fill_buf()?;
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(BoundedLine::Timeout);
+        }
+        let _ = reader
+            .get_ref()
+            .set_read_timeout(Some(deadline.saturating_duration_since(now)));
+        let avail = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                return Ok(BoundedLine::Timeout);
+            }
+            Err(e) => return Err(e),
+        };
         if avail.is_empty() {
             return Ok(if total == 0 {
                 BoundedLine::Eof

@@ -2,9 +2,9 @@
 
 # `rust-sandbox` (`rsb`)
 
-**Rootless Linux process isolation engine, CLI, and C/Python FFI library in pure Rust**
+**Rootless Linux process sandbox in pure Rust**
 
-*Namespaces · Landlock LSM · Seccomp-BPF · Cgroups v2 · OverlayFS CoW · `smoltcp` TAP Egress Filter*
+*Namespaces · Landlock LSM · Seccomp-BPF · Cgroups v2 · OverlayFS CoW · `smoltcp` TAP*
 
 <p>
   <a href="https://github.com/Shura5860/rust-sandbox/actions/workflows/ci.yml">
@@ -25,6 +25,7 @@
   <a href="#türkçe">Türkçe</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="ARCHITECTURE.md">Architecture</a> ·
+  <a href="SECURITY.md">Security</a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -34,191 +35,159 @@
 
 ## English
 
-`rust-sandbox` (`rsb`) is a Linux process isolation engine, CLI, and embeddable Rust library designed for running untrusted code, scripts, and AI-agent tools with minimal overhead. It combines rootless Linux kernel primitives (namespaces, Landlock LSM, Seccomp-BPF, Cgroups v2, OverlayFS) with userspace network filtering in a single workspace with C and Python FFI bindings.
+`rsb` runs untrusted binaries, scripts, and AI-agent code inside a rootless Linux sandbox. It talks directly to Linux kernel primitives (namespaces, Landlock, Seccomp-BPF, Cgroups v2, OverlayFS) without shelling out to Docker, `bwrap`, or `libseccomp`, and ships as a CLI, a Rust library, and a C/Python FFI shared object (`librsb_ffi.so`).
 
 ### Quick Start
 
 ```bash
-# 1. Build the CLI (`rsb`) and shared FFI library (`librsb_ffi.so`)
+# Build the CLI (`rsb`) and shared FFI library (`librsb_ffi.so`)
 cargo build --workspace --release
 
-# 2. Check supported kernel features on your machine (Landlock ABI, userns, Cgroups v2)
+# Inspect what the running kernel supports (Landlock ABI, userns, AppArmor, Cgroups v2)
 ./target/release/rsb info
 
-# 3. Run a command with read-only system runtime and a single writable directory
+# Run a command with read-only system libs and one writable directory
 ./target/release/rsb run --rw ./work --stats -- /bin/sh -c 'echo hello > ./work/out.txt'
 
-# 4. Execute untrusted code in JSON mode with a timeout and bounded output capture
-./target/release/rsb ai-exec --timeout-ms 2000 -- /usr/bin/python3 -c 'print(6 * 7)'
+# Run in JSON mode with a built-in preset and audit log
+./target/release/rsb ai-exec --preset strict-offline --audit-log ./audit.jsonl -- \
+  /usr/bin/python3 -c 'print(6 * 7)'
 ```
 
-### Architecture & Capabilities
+Nix flake users can build directly with `nix build`.
 
-```text
-+-------------------------------------------------------------------+
-|  CLI (`rsb`)  |  Rust SDK (`rsb-core`)  |  C / Python (`rsb-ffi`) |
-+-------------------------------------------------------------------+
-|  Policy & Profile Layer (`SandboxBuilder`, `sandbox.toml`)        |
-+---------------+---------------+-----------------+-----------------+
-|  Namespaces   |  Landlock LSM |   Seccomp-BPF   |   Cgroups v2    |
-|  (clone3,     |  (ABI v1-v11+ |   (pure-Rust    |  (memory, cpu,  |
-|   PID 1 init, |   path rules) |   cBPF, unotify)|   pids, rlimit) |
-|   pivot_root) |               |                 |                 |
-+---------------+---------------+-----------------+-----------------+
-|  Ephemeral CoW OverlayFS (`--cow`)  |  Egress Filter (`rsb-net`)  |
-|  (userxattr + Added/Mod/Del diff)   |  (Proxy & smoltcp TAP)      |
-+-------------------------------------+-----------------------------+
-|  Syscall Layer (`rsb-sys`: rustix linux_raw + raw Linux syscalls) |
-+-------------------------------------------------------------------+
-```
+### What's Inside (v0.2.0)
 
-#### Process & Filesystem Isolation
-- **Rootless Namespaces & Rootfs:** `clone3` (`USER`, `PID`, `MOUNT`, `IPC`, `UTS`, `NET`) with automatic `clone(2)` fallback when an outer seccomp filter returns `ENOSYS`. Includes a lightweight PID 1 subreaper inside `CLONE_NEWPID` and optional `pivot_root` with masked `/proc` subpaths.
-- **Landlock LSM:** Queries the host kernel's Landlock ABI version at runtime and masks access rights accordingly across kernel versions.
-- **Ephemeral Copy-on-Write (`--cow`):** Mounts rootless `userxattr` OverlayFS inside the mount namespace, reports `added` / `modified` / `deleted` paths on exit, and cleans up staging directories automatically.
-- **Pre-compiled Child Setup:** `PreparedSandbox` resolves paths, `argv`/`envp`, Landlock masks, and BPF bytecode in the parent so the post-`clone3` child avoids heap allocations before `execve`.
+- **Namespaces & Rootfs:** `clone3` (`USER`, `PID`, `MOUNT`, `IPC`, `UTS`, `NET`) with automatic `clone(2)` fallback if an outer seccomp filter returns `ENOSYS`. Runs a small PID 1 subreaper inside `CLONE_NEWPID`, masks sensitive `/proc` and `/sys` paths, and supports `--rootfs` (`pivot_root` + minimal tmpfs `/dev`).
+- **Landlock LSM (ABI v1–v6+):** Detects the kernel ABI at runtime. Enforces filesystem path rules (v1+), blocks TCP bind/connect when network is disabled (v4+), and scopes abstract UNIX sockets and signals to the sandbox domain (v6+).
+- **Seccomp-BPF & `unotify`:** Pure-Rust classic BPF compiler with `AUDIT_ARCH` validation, `x32` ABI rejection on `x86_64`, `TIOCSTI`/`TIOCLINUX` blocking, socket domain filtering, strict allowlist mode, and live userspace supervision via `SECCOMP_RET_USER_NOTIF`.
+- **Cgroups v2 & Limits:** Discovers delegated Cgroups v2 subtrees (including sibling leaf creation under systemd user slices) and applies `memory.max` + `memory.swap.max=0`, `pids.max`, `cpu.max`, and `io.max`, alongside `RLIMIT_CORE=0`, configurable `RLIMIT_NOFILE`, `close_range`, capability dropping, and a sanitized default environment.
+- **Ephemeral CoW (`--cow`):** Mounts rootless `userxattr` OverlayFS over target directories so the host copy stays untouched, reports `added` / `modified` / `deleted` paths (including recursive opaque directory deletions), and wipes staging directories on exit.
+- **Network Egress Filtering (`rsb-net`):** Domain/wildcard and IPv4/IPv6 CIDR allowlists with default SSRF blocking (loopback, `169.254.0.0/16` metadata, RFC1918, NAT64/6to4/Teredo). Works either as an HTTP/HTTPS `CONNECT` proxy or as a transparent rootless `CLONE_NEWNET` + `tap0` + `smoltcp` L2/L3 bridge (`--transparent-tap`) with UDP/53 DNS filtering and multi-record TLS `ClientHello` SNI verification (ECH rejected, no MITM).
+- **Policy Learning (`rsb learn`):** Traces a command with `ptrace` on `x86_64` and `aarch64`, records succeeded syscalls/paths, and writes a `sandbox.toml` profile. Supports `--strict` (syscall allowlist) and `--merge` (union across multiple runs).
+- **Persistent Sessions & Presets:** `rsb session <start|exec|ls|stop>` keeps a scoped working directory across multiple `ai-exec` calls; built-in presets (`python-ai`, `node-build`, `strict-offline`) and shell completions (`rsb completions bash|zsh|fish`) cut down CLI boilerplate.
+- **Zygote Pools & C/Python FFI:** Pre-warmed Python (CoW `fork()`) and Node.js (detached child process per request) pools that inherit Landlock + Seccomp without cold-start overhead. `librsb_ffi.so` exposes `rsb_exec_json`, `rsb_exec_profile_toml_json`, and the Python Zygote API (`bindings/c/rsb.h`, `bindings/python/rsb.py`).
 
-#### Syscall & Resource Controls
-- **Pure-Rust Seccomp-BPF & `seccomp-unotify`:** Compiles classic BPF directly in Rust (`AUDIT_ARCH` check, `x32` ABI rejection on `x86_64`, `TIOCSTI`/`TIOCLINUX` blocking, socket domain filtering, strict allowlist mode, and live userspace syscall supervision via `SECCOMP_RET_USER_NOTIF`).
-- **Quotas & Process Hygiene:** Delegated Cgroups v2 (`CLONE_INTO_CGROUP` with `cgroup.procs` fallback), `setrlimit` (`RLIMIT_CORE=0`, configurable `RLIMIT_NOFILE`), `close_range` FD cleanup, capability dropping (`PR_CAPBSET_DROP` + `capset`), `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG`, and sanitized default environment variables.
-
-#### Network Egress Filtering (`rsb-net`)
-- **Allowlists & SSRF Protection:** Domain wildcard and IPv4/IPv6 CIDR + port allowlists with default blocking of loopback, link-local / cloud metadata (`169.254.0.0/16`), and RFC1918 ranges.
-- **Proxy & Transparent TAP Modes:** Pure-Rust TLS `ClientHello` SNI inspection without decryption, available via both an HTTP/HTTPS `CONNECT` proxy (`--allow-domain`) and a transparent rootless `CLONE_NEWNET` + `tap0` + `smoltcp` L2/L3 bridge (`--transparent-tap`) with built-in UDP/53 DNS filtering.
-
-#### Tooling, Runtimes & Embeddings
-- **Policy Learning (`rsb learn`):** Traces a target command via `ptrace` and writes a reusable `sandbox.toml` profile (optionally with `--strict` syscall allowlist).
-- **Pre-warmed Worker Pools (`ZygotePool`):** Keeps a confined Python interpreter warm and forks per request via Linux CoW `fork()` (closing control-channel FDs and redirecting `stdin` to `/dev/null` in each worker), plus an OS-process-isolated Node.js worker pool.
-- **C & Python Bindings (`rsb-ffi`):** Exports a C ABI (`librsb_ffi.so`, `bindings/c/rsb.h`) and a `ctypes` Python wrapper (`bindings/python/rsb.py`) covering both one-shot execution and `ZygotePool`.
-
-### More Examples
+### Common Workflows
 
 ```bash
-# Learn a sandbox.toml profile and replay it
-./target/release/rsb learn --strict --out sandbox.toml -- /bin/sh -c 'echo hello'
-./target/release/rsb run --profile sandbox.toml -- /bin/sh -c 'echo hello'
+# Learn a strict profile across two runs and replay it
+./target/release/rsb learn --strict --out sandbox.toml -- /bin/sh -c 'echo run1'
+./target/release/rsb learn --merge  --out sandbox.toml -- /bin/sh -c 'echo run2'
+./target/release/rsb run --profile sandbox.toml -- /bin/sh -c 'echo run2'
 
-# Ephemeral CoW OverlayFS (host directory stays untouched; JSON reports cow_diffs)
+# Run mutations against a real directory without touching the host copy
 ./target/release/rsb ai-exec --cow ./work -- /bin/sh -c 'rm -rf ./work/*; echo temp > ./work/x'
 
-# Transparent rootless TAP + smoltcp L2/L3 egress filter
-./target/release/rsb run --transparent-tap --allow-domain example.com:443 -- /usr/bin/curl -sI https://example.com
+# Transparent L2/L3 network filter (works even for binaries that ignore HTTP_PROXY)
+./target/release/rsb run --transparent-tap --allow-domain example.com:443 -- \
+  /usr/bin/curl -sI https://example.com
 
-# Benchmark cold Python vs. warm Zygote execution on your machine
-./target/release/rsb zygote-bench --iters 20
+# Stateful agent session
+SID=$(./target/release/rsb session start --preset python-ai)
+./target/release/rsb session exec "$SID" -- /usr/bin/python3 -c 'open("data.txt","w").write("42")'
+./target/release/rsb session exec "$SID" -- /usr/bin/python3 -c 'print(open("data.txt").read())'
+./target/release/rsb session stop "$SID"
 
-# Run the Rust SDK example and Python ctypes FFI example
-cargo run --release -p rsb-core --example ai_sandbox
-python3 bindings/python/rsb.py
+# Local startup & Zygote latency benchmark
+bash benchmarks/bench.sh 20
 ```
 
-### Workspace Structure
+### Workspace Layout
 
-| Crate / Path | Purpose |
+| Path | Description |
 |---|---|
-| `crates/rsb-sys` | Low-level Linux syscall wrappers (`rustix` `linux_raw` + raw `clone3`, Landlock, `seccomp`, `ptrace`, `tap`, `unotify`). |
-| `crates/rsb-core` | Core sandbox engine, `PreparedSandbox`, cBPF compiler, Cgroups v2, OverlayFS CoW, `sandbox.toml`, `learn_policy`, `unotify`, `ZygotePool`. |
-| `crates/rsb-net` | L3/L4/L7 egress policy, SSRF guard, TLS SNI parser, DNS wire parser, `EgressProxy`, and `smoltcp` L2/L3 `SlirpBridge`. |
+| `crates/rsb-sys` | Raw Linux syscall wrappers (`rustix` `linux_raw`, `clone3`, Landlock, `seccomp`, `ptrace`, `tap`, `unotify`). |
+| `crates/rsb-core` | Sandbox engine, `PreparedSandbox`, cBPF compiler, Cgroups v2, OverlayFS CoW, `sandbox.toml`, `learn`, `ZygotePool`. |
+| `crates/rsb-net` | Egress policy, SSRF guard, TLS SNI & DNS parsers, `EgressProxy`, and `smoltcp` `SlirpBridge`. |
 | `crates/rsb-ffi` | C ABI shared library (`librsb_ffi.so`). |
-| `crates/rsb-cli` | `rsb` command-line interface (`info`, `run`, `ai-exec`, `learn`, `zygote-bench`). |
+| `crates/rsb-cli` | `rsb` CLI (`info`, `run`, `ai-exec`, `learn`, `session`, `completions`, `zygote-bench`). |
 | `bindings/` | C header (`bindings/c/rsb.h`) and Python `ctypes` wrapper (`bindings/python/rsb.py`). |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Internal design decisions, kernel fallbacks, and known security boundaries. |
-| [CHANGELOG.md](CHANGELOG.md) | Version history and release notes. |
+| `fuzz/` | `cargo-fuzz` (`libFuzzer`) targets for TOML profile, TLS SNI, and DNS parsers. |
+| `benchmarks/` | Reproducible startup & Zygote latency script (`benchmarks/bench.sh`). |
 
-### Tests & Local Measurements
+### Verification & Notes
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Observed on an `x86_64` Linux 7.3 host (results vary by hardware and kernel):
-- Sandbox setup latency (`rsb run` / `rsb ai-exec` with Landlock + 72-instruction Seccomp-BPF): ~`0.6 – 1.0 ms`
-- Python `ZygotePool` round-trip (20 warm runs, Landlock + Seccomp-BPF): ~`1.2 – 1.4 ms` average
-- Test suite: 36 automated tests including 8 adversarial escape checks (`crates/rsb-core/tests/escape_suite.rs`) and 50,000 deterministic fuzz inputs across the TLS SNI, DNS, and TOML parsers.
-
-### Scope & Requirements
-
-- **OS:** Linux (`x86_64`; `aarch64` syscall layers included, `rsb learn` is currently `x86_64`-only).
-- **Kernel features:** Unprivileged user namespaces (`CLONE_NEWUSER`) for namespace/OverlayFS/TAP features; Landlock LSM (Linux 5.13+) for path rules; delegated Cgroups v2 for memory/CPU/PID quotas (gracefully skipped when unavailable).
-- **License:** Dual-licensed under MIT or Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
+- **Tests:** 37 automated tests (unit, integration, 8 adversarial escape checks in `crates/rsb-core/tests/escape_suite.rs`, plus deterministic parser fuzzing).
+- **Platform:** Linux `x86_64` and `aarch64`. Needs unprivileged user namespaces for namespace/OverlayFS/TAP modes, Landlock (Linux 5.13+) for path rules, and delegated Cgroups v2 for memory/CPU/PID/IO quotas (skipped cleanly when unavailable).
+- **Security boundary:** `rsb` isolates processes using Linux kernel primitives, not a separate VM kernel. See [SECURITY.md](SECURITY.md) and [ARCHITECTURE.md](ARCHITECTURE.md) for the threat model and known limits.
+- **License:** MIT or Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
 
 ---
 
 ## Türkçe
 
-`rust-sandbox` (`rsb`), güvenilmeyen kodları, betikleri ve yapay zeka ajanı araçlarını düşük ek yükle izole ederek çalıştırmak için Rust ile yazılmış bir Linux süreç izolasyon motoru, CLI aracı ve gömülebilir kütüphanedir. Root yetkisi gerektirmeyen Linux çekirdek mekanizmalarını (namespace'ler, Landlock LSM, Seccomp-BPF, Cgroups v2, OverlayFS) userspace ağ filtrelemesi ve C/Python FFI bağlayıcılarıyla tek bir workspace içinde birleştirir.
+`rsb`, güvenilmeyen ikili dosyaları, betikleri ve yapay zeka ajanı kodlarını root yetkisi gerektirmeden izole eden saf Rust tabanlı bir Linux sandbox motorudur. Docker, `bwrap` veya `libseccomp` çağırmadan doğrudan Linux çekirdek arayüzleriyle (namespaces, Landlock, Seccomp-BPF, Cgroups v2, OverlayFS) çalışır; CLI, Rust kütüphanesi ve C/Python FFI paylaşımlı kütüphanesi (`librsb_ffi.so`) olarak kullanılabilir.
 
 ### Hızlı Başlangıç
 
 ```bash
-# 1. CLI (`rsb`) ve paylaşımlı FFI kütüphanesini (`librsb_ffi.so`) derleyin
+# CLI (`rsb`) ve paylaşımlı FFI kütüphanesini (`librsb_ffi.so`) derleyin
 cargo build --workspace --release
 
-# 2. Sistemdeki çekirdek yeteneklerini kontrol edin (Landlock ABI, userns, Cgroups v2)
+# Çekirdeğin desteklediği özellikleri görün (Landlock ABI, userns, AppArmor, Cgroups v2)
 ./target/release/rsb info
 
-# 3. Salt-okunur sistem ortamı ve tek bir yazılabilir dizinle komut çalıştırın
+# Salt-okunur sistem kütüphaneleri ve tek yazılabilir dizinle komut çalıştırın
 ./target/release/rsb run --rw ./work --stats -- /bin/sh -c 'echo merhaba > ./work/out.txt'
 
-# 4. Zaman aşımı ve sınırlı çıktı yakalamayla JSON modunda kod yürütün
-./target/release/rsb ai-exec --timeout-ms 2000 -- /usr/bin/python3 -c 'print(6 * 7)'
+# Hazır profil (preset) ve JSONL denetim kaydıyla JSON modunda kod yürütün
+./target/release/rsb ai-exec --preset strict-offline --audit-log ./audit.jsonl -- \
+  /usr/bin/python3 -c 'print(6 * 7)'
 ```
 
-### Mimari ve Özellikler
+Nix flake ile doğrudan `nix build` kullanarak da derleyebilirsiniz.
 
-#### Süreç ve Dosya Sistemi İzolasyonu
-- **Rootless Namespace ve Rootfs:** `clone3` (`USER`, `PID`, `MOUNT`, `IPC`, `UTS`, `NET`) ve dış ortam seccomp'u `ENOSYS` döndürdüğünde otomatik `clone(2)` geçişi. `CLONE_NEWPID` içinde hafif PID 1 subreaper döngüsü ve isteğe bağlı `pivot_root` + maskelenmiş `/proc` desteği.
-- **Landlock LSM:** Çalışan çekirdeğin desteklediği Landlock ABI sürümünü çalışma zamanında sorgular ve erişim bayraklarını ilgili sürüme göre maskeler.
-- **Geçici Copy-on-Write (`--cow`):** Mount namespace içinde rootless `userxattr` OverlayFS bağlar; çıkışta `added` / `modified` / `deleted` değişikliklerini raporlar ve geçici dizinleri otomatik temizler.
-- **Önceden Derlenmiş Çocuk Kurulumu:** `PreparedSandbox`, yol çözümleme, `argv`/`envp`, Landlock maskeleri ve BPF bytecode'unu ana süreçte hazırlar; böylece `clone3` sonrası çocuk süreç `execve` öncesinde heap tahsisinden kaçınır.
+### Neler Var? (v0.2.0)
 
-#### Syscall ve Kaynak Kontrolleri
-- **Saf Rust Seccomp-BPF ve `seccomp-unotify`:** Klasik BPF komutlarını doğrudan Rust ile derler (`AUDIT_ARCH` doğrulaması, `x86_64` üzerinde `x32` ABI reddi, `TIOCSTI`/`TIOCLINUX` engellemesi, soket domain filtresi, katı allowlist modu ve `SECCOMP_RET_USER_NOTIF` ile canlı denetim).
-- **Kotalar ve Süreç Hijyeni:** Delege edilmiş Cgroups v2 (`CLONE_INTO_CGROUP` + `cgroup.procs` yedeği), `setrlimit` (`RLIMIT_CORE=0`, yapılandırılabilir `RLIMIT_NOFILE`), `close_range` ile açık FD temizliği, yetki (capability) düşürme, `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG` ve temizlenmiş varsayılan ortam değişkenleri.
+- **Namespace & Rootfs:** `clone3` (`USER`, `PID`, `MOUNT`, `IPC`, `UTS`, `NET`); dış ortam seccomp'u `ENOSYS` döndürürse otomatik `clone(2)` yedeğine geçer. `CLONE_NEWPID` içinde hafif PID 1 subreaper çalıştırır, hassas `/proc` ve `/sys` yollarını maskeler ve `--rootfs` (`pivot_root` + minimal tmpfs `/dev`) destekler.
+- **Landlock LSM (ABI v1–v6+):** Çalışan çekirdeğin ABI sürümünü otomatik algılar. Dosya yolu kurallarına (v1+) ek olarak ağ kapalıyken TCP bind/connect engellemesi (v4+) ve abstract UNIX soket / sinyal kapsam izolasyonu (v6+) uygular.
+- **Seccomp-BPF & `unotify`:** Saf Rust cBPF derleyicisi; `AUDIT_ARCH` denetimi, `x86_64`'te `x32` ABI reddi, `TIOCSTI`/`TIOCLINUX` engellemesi, soket domain filtresi, katı allowlist modu ve `SECCOMP_RET_USER_NOTIF` ile canlı denetim içerir.
+- **Cgroups v2 & Sınırlar:** Delege edilmiş Cgroups v2 dizinlerini (systemd user slice altındaki kardeş yapraklar dahil) bulur; `memory.max` + `memory.swap.max=0`, `pids.max`, `cpu.max` ve `io.max` kotalarını `RLIMIT_CORE=0`, `RLIMIT_NOFILE`, `close_range`, yetki düşürme ve temizlenmiş ortam değişkenleriyle birlikte uygular.
+- **Geçici CoW (`--cow`):** Hedef dizinlere rootless `userxattr` OverlayFS bağlar; host kopyasına dokunmadan tüm `added` / `modified` / `deleted` (özyinelemeli opaque dizin silmeleri dahil) değişikliklerini raporlar ve çıkışta geçici katmanı siler.
+- **Ağ Çıkış Filtresi (`rsb-net`):** Domain/wildcard ve IPv4/IPv6 CIDR izin listeleri, varsayılan SSRF engellemesi (loopback, `169.254.0.0/16` metadata, RFC1918, NAT64/6to4/Teredo). İster HTTP/HTTPS `CONNECT` proxy, ister `HTTP_PROXY`'yi yoksayabilen uygulamalar için şeffaf `CLONE_NEWNET` + `tap0` + `smoltcp` L2/L3 köprüsü (`--transparent-tap`, UDP/53 DNS filtresi + çoklu kayıt TLS `ClientHello` SNI doğrulaması, ECH reddi, MITM yok).
+- **Politika Öğrenme (`rsb learn`):** `x86_64` ve `aarch64` üzerinde komutu `ptrace` ile izleyip başarılı syscall/dosya erişimlerinden `sandbox.toml` üretir; `--strict` (syscall allowlist) ve `--merge` (birden fazla koşuyu birleştirme) destekler.
+- **Kalıcı Oturumlar & Hazır Profiller:** `rsb session <start|exec|ls|stop>` birden fazla `ai-exec` çağrısında izole çalışma dizinini korur; yerleşik profiller (`python-ai`, `node-build`, `strict-offline`) ve kabuk tamamlama (`rsb completions bash|zsh|fish`) ile hızlı kullanım sağlar.
+- **Zygote Havuzları & C/Python FFI:** Landlock + Seccomp sınırını devralan sıcak Python (CoW `fork()`) ve Node.js (istek başına ayrık süreç) havuzları. `librsb_ffi.so` üzerinden `rsb_exec_json`, `rsb_exec_profile_toml_json` ve Python Zygote API'si sunulur (`bindings/c/rsb.h`, `bindings/python/rsb.py`).
 
-#### Ağ Çıkış Filtrelemesi (`rsb-net`)
-- **İzin Listeleri ve SSRF Koruması:** Wildcard destekli domain ve IPv4/IPv6 CIDR + port kuralları ile loopback, link-local / bulut metadata (`169.254.0.0/16`) ve RFC1918 özel ağlarının varsayılan olarak engellenmesi.
-- **Proxy ve Şeffaf TAP Modları:** TLS şifresini çözmeden `ClientHello` üzerinden SNI doğrulaması; hem HTTP/HTTPS `CONNECT` proxy (`--allow-domain`) hem de dahili UDP/53 DNS filtreli şeffaf `CLONE_NEWNET` + `tap0` + `smoltcp` L2/L3 köprüsü (`--transparent-tap`).
-
-#### Araçlar, Çalışma Zamanları ve Entegrasyon
-- **Otomatik Politika Üretimi (`rsb learn`):** Hedef komutu `ptrace` altında gözlemleyerek yeniden kullanılabilir bir `sandbox.toml` profili üretir (`--strict` ile syscall allowlist'i dahil).
-- **Önceden Isıtılmış İşçi Havuzları (`ZygotePool`):** İzole edilmiş sıcak Python yorumlayıcısını Linux CoW `fork()` ile istek başına dallandırır (çocuk süreçte kontrol kanalı FD'lerini kapatır ve `stdin`'i `/dev/null`'a yönlendirir); ayrıca her istekte ayrı OS süreci açan Node.js işçi havuzu sunar.
-- **C ve Python Bağlayıcıları (`rsb-ffi`):** `librsb_ffi.so`, `bindings/c/rsb.h` ve `ctypes` tabanlı `bindings/python/rsb.py` üzerinden hem tek seferlik çalıştırma hem de `ZygotePool` erişimi.
-
-### Diğer Örnekler
+### Sık Kullanılan Örnekler
 
 ```bash
-# Otomatik sandbox.toml profili üretme ve yeniden çalıştırma
-./target/release/rsb learn --strict --out sandbox.toml -- /bin/sh -c 'echo merhaba'
-./target/release/rsb run --profile sandbox.toml -- /bin/sh -c 'echo merhaba'
+# İki farklı koşudan katı profil öğrenip tekrar çalıştırma
+./target/release/rsb learn --strict --out sandbox.toml -- /bin/sh -c 'echo run1'
+./target/release/rsb learn --merge  --out sandbox.toml -- /bin/sh -c 'echo run2'
+./target/release/rsb run --profile sandbox.toml -- /bin/sh -c 'echo run2'
 
-# Geçici CoW OverlayFS (host dizini değişmez; JSON çıktısında cow_diffs raporlanır)
+# Host dizinine dokunmadan geçici CoW testi
 ./target/release/rsb ai-exec --cow ./work -- /bin/sh -c 'rm -rf ./work/*; echo temp > ./work/x'
 
-# Şeffaf rootless TAP + smoltcp L2/L3 çıkış filtresi
-./target/release/rsb run --transparent-tap --allow-domain example.com:443 -- /usr/bin/curl -sI https://example.com
+# Şeffaf L2/L3 ağ filtresi
+./target/release/rsb run --transparent-tap --allow-domain example.com:443 -- \
+  /usr/bin/curl -sI https://example.com
 
-# Rust SDK ve Python FFI örnekleri
-cargo run --release -p rsb-core --example ai_sandbox
-python3 bindings/python/rsb.py
+# Durum koruyan ajan oturumu
+SID=$(./target/release/rsb session start --preset python-ai)
+./target/release/rsb session exec "$SID" -- /usr/bin/python3 -c 'open("data.txt","w").write("42")'
+./target/release/rsb session exec "$SID" -- /usr/bin/python3 -c 'print(open("data.txt").read())'
+./target/release/rsb session stop "$SID"
+
+# Yerel gecikme ve Zygote ölçümü
+bash benchmarks/bench.sh 20
 ```
 
-### Testler ve Yerel Gözlemler
+### Doğrulama ve Sınırlar
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`x86_64` Linux 7.3 üzerinde gözlemlenen değerler (donanım ve çekirdek sürümüne göre değişiklik gösterir):
-- Sandbox kurulum süresi (Landlock + 72 komutluk Seccomp-BPF ile): ~`0.6 – 1.0 ms`
-- Python `ZygotePool` gidiş-dönüş süresi (20 sıcak çalıştırma ortalaması): ~`1.2 – 1.4 ms`
-- Otomatik test paketi: 8 kaçış testi (`crates/rsb-core/tests/escape_suite.rs`) ve TLS SNI, DNS, TOML ayrıştırıcıları üzerinde 50.000 deterministik fuzz girdisi dahil toplam 36 test.
-
-### Kapsam ve Gereksinimler
-
-- **İşletim Sistemi:** Linux (`x86_64`; `aarch64` syscall katmanı dahildir, `rsb learn` şu an yalnızca `x86_64` destekler).
-- **Çekirdek Özellikleri:** Namespace, OverlayFS ve TAP özellikleri için rootless user namespaces (`CLONE_NEWUSER`); dosya yolu kuralları için Landlock LSM (Linux 5.13+); bellek/CPU/PID kotaları için delege edilmiş Cgroups v2 (erişilemediğinde güvenli biçimde atlanır).
-- **Mimari ve Sürüm Geçmişi:** Tasarım kararları ve bilinen sınırlar [ARCHITECTURE.md](ARCHITECTURE.md), sürüm notları [CHANGELOG.md](CHANGELOG.md) dosyasında yer alır.
+- **Testler:** 37 otomatik test (birim, entegrasyon, `crates/rsb-core/tests/escape_suite.rs` içinde 8 kaçış denemesi ve deterministik ayrıştırıcı fuzz testleri).
+- **Platform:** Linux `x86_64` ve `aarch64`. Namespace/OverlayFS/TAP için rootless user namespaces, dosya yolu kuralları için Landlock (Linux 5.13+), kaynak kotaları için delege edilmiş Cgroups v2 gerekir (yoksa güvenli biçimde atlanır).
+- **Güvenlik sınırı:** `rsb` ayrı bir VM çekirdeği değil, Linux çekirdek izolasyon primitiflerini kullanır. Tehdit modeli ve bilinen sınırlar için [SECURITY.md](SECURITY.md) ve [ARCHITECTURE.md](ARCHITECTURE.md) dosyalarına bakın.
 - **Lisans:** MIT veya Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).

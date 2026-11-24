@@ -4,29 +4,101 @@
 //! without performing TLS termination or MITM decryption. Prevents DNS rebinding
 //! and shared-CDN host spoofing when enforcing `--allow-domain`.
 
-/// If `buf` begins with a TLS Handshake record (`0x16`), return its full expected
-/// record length (`5 + record_len`) once at least 5 header bytes have been buffered.
+/// Maximum TLS ClientHello wire bytes we buffer across contiguous Handshake records.
+pub const MAX_CLIENT_HELLO_BYTES: usize = 16_384 + 64;
+
+/// If `buf` begins with a TLS Handshake record (`0x16`), return the total wire byte
+/// length needed to cover the full `ClientHello` handshake message across one or more
+/// contiguous `0x16` records (RFC 8446 multi-record `ClientHello`), once enough header
+/// bytes have been buffered.
 pub fn tls_record_expected_len(buf: &[u8]) -> Option<usize> {
-    if buf.len() >= 5 && buf[0] == 0x16 {
-        Some(5 + u16::from_be_bytes([buf[3], buf[4]]) as usize)
-    } else {
-        None
+    if buf.len() < 5 || buf[0] != 0x16 {
+        return None;
     }
+    let mut off = 0usize;
+    let mut payload_len = 0usize;
+    let mut hs_need: Option<usize> = None;
+    let mut hs_hdr = [0u8; 4];
+    let mut hs_hdr_len = 0usize;
+
+    while off + 5 <= buf.len() && buf[off] == 0x16 {
+        let rec_len = u16::from_be_bytes([buf[off + 3], buf[off + 4]]) as usize;
+        if rec_len == 0 {
+            // Invalid zero-length Handshake record; stop buffering so extract_tls_sni rejects it.
+            return Some(off + 5);
+        }
+        let rec_start = off + 5;
+        let rec_end = rec_start.saturating_add(rec_len);
+
+        if hs_hdr_len < 4 && rec_start < buf.len() {
+            let avail = (buf.len().min(rec_end)) - rec_start;
+            let take = avail.min(4 - hs_hdr_len);
+            hs_hdr[hs_hdr_len..hs_hdr_len + take]
+                .copy_from_slice(&buf[rec_start..rec_start + take]);
+            hs_hdr_len += take;
+            if hs_hdr_len == 4 && hs_need.is_none() {
+                if hs_hdr[0] != 0x01 {
+                    return Some(rec_end.min(MAX_CLIENT_HELLO_BYTES));
+                }
+                let hs_len = ((hs_hdr[1] as usize) << 16)
+                    | ((hs_hdr[2] as usize) << 8)
+                    | (hs_hdr[3] as usize);
+                hs_need = Some(4 + hs_len);
+            }
+        }
+
+        if rec_end > buf.len() {
+            return Some(rec_end.min(MAX_CLIENT_HELLO_BYTES));
+        }
+
+        payload_len = payload_len.saturating_add(rec_len);
+        off = rec_end;
+
+        if let Some(need) = hs_need
+            && payload_len >= need
+        {
+            return Some(off);
+        }
+        if payload_len >= 16_384 || off >= MAX_CLIENT_HELLO_BYTES {
+            return Some(off);
+        }
+    }
+
+    if off < buf.len() && buf[off] != 0x16 {
+        return Some(buf.len());
+    }
+    // Need at least the 5-byte header of the next contiguous Handshake record.
+    Some(off.saturating_add(5).min(MAX_CLIENT_HELLO_BYTES))
 }
 
 /// Extract the TLS SNI hostname (extension type `0x0000`, `host_name` type `0x00`)
-/// from a raw TLS record beginning with a `ClientHello` handshake message.
+/// from one or more contiguous TLS Handshake (`0x16`) records beginning with a
+/// `ClientHello` handshake message (supports RFC 8446 multi-record `ClientHello`).
 ///
 /// Returns `Some(hostname)` if a valid SNI extension is found, or `None` if the
-/// payload is not a TLS `ClientHello`, is truncated, or has no SNI extension.
+/// payload is not a TLS `ClientHello`, is truncated, contains duplicate SNI entries,
+/// uses Encrypted Client Hello (`0xfe0d`), or has no SNI extension.
 pub fn extract_tls_sni(buf: &[u8]) -> Option<String> {
-    // TLS record header: [content_type: 1][version: 2][length: 2]
+    // Reassemble contiguous TLS Handshake (0x16) records up to 16 KiB.
     if buf.len() < 5 || buf[0] != 0x16 {
-        // 0x16 = Handshake
         return None;
     }
-    let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-    let payload = buf.get(5..5 + record_len).or_else(|| buf.get(5..))?;
+    let mut reassembled: Vec<u8> = Vec::new();
+    let mut off = 0usize;
+    while off + 5 <= buf.len() && buf[off] == 0x16 && reassembled.len() < 16_384 {
+        let rec_len = u16::from_be_bytes([buf[off + 3], buf[off + 4]]) as usize;
+        if rec_len == 0 {
+            return None;
+        }
+        off += 5;
+        let take = rec_len.min(buf.len() - off).min(16_384 - reassembled.len());
+        reassembled.extend_from_slice(&buf[off..off + take]);
+        off += take;
+        if take < rec_len {
+            break;
+        }
+    }
+    let payload: &[u8] = &reassembled;
 
     // Handshake header: [msg_type: 1][length: 3]
     if payload.len() < 4 || payload[0] != 0x01 {
@@ -36,7 +108,9 @@ pub fn extract_tls_sni(buf: &[u8]) -> Option<String> {
     let hs_len = ((payload[1] as usize) << 16)
         | ((payload[2] as usize) << 8)
         | (payload[3] as usize);
-    let body = payload.get(4..4 + hs_len).or_else(|| payload.get(4..))?;
+    // Reject truncated ClientHello messages so a trailing ECH (0xfe0d) or duplicate
+    // SNI extension cannot be hidden past a record boundary.
+    let body = payload.get(4..4 + hs_len)?;
 
     // ClientHello body:
     // - legacy_version (2 bytes)
@@ -64,7 +138,10 @@ pub fn extract_tls_sni(buf: &[u8]) -> Option<String> {
     }
     let ext_total = u16::from_be_bytes([*body.get(pos)?, *body.get(pos + 1)?]) as usize;
     pos += 2;
-    let ext_end = (pos + ext_total).min(body.len());
+    if pos + ext_total > body.len() {
+        return None;
+    }
+    let ext_end = pos + ext_total;
 
     let mut found_sni: Option<String> = None;
     let mut saw_sni_ext = false;
@@ -123,6 +200,10 @@ pub fn extract_tls_sni(buf: &[u8]) -> Option<String> {
         pos += ext_len;
     }
 
+    if pos != ext_end {
+        return None;
+    }
+
     found_sni
 }
 
@@ -175,6 +256,34 @@ pub(crate) mod tests {
         let pkt = build_test_client_hello("API.OpenAI.com");
         assert_eq!(extract_tls_sni(&pkt).as_deref(), Some("api.openai.com"));
         assert_eq!(extract_tls_sni(b"GET / HTTP/1.1\r\n"), None);
+
+        // Truncated ClientHello MUST be rejected (prevents hiding ECH / duplicate SNI in tail)
+        assert_eq!(extract_tls_sni(&pkt[..pkt.len() - 1]), None);
+
+        // Multi-record ClientHello split across 2 TLS Handshake (0x16) records
+        let hs = &pkt[5..];
+        let mid = hs.len() / 2;
+        let mut multi = Vec::new();
+        multi.push(0x16);
+        multi.extend_from_slice(&[0x03, 0x01]);
+        multi.extend_from_slice(&(mid as u16).to_be_bytes());
+        multi.extend_from_slice(&hs[..mid]);
+        let rec1_len = multi.len();
+        multi.push(0x16);
+        multi.extend_from_slice(&[0x03, 0x01]);
+        multi.extend_from_slice(&((hs.len() - mid) as u16).to_be_bytes());
+        multi.extend_from_slice(&hs[mid..]);
+
+        // After only record 1, tls_record_expected_len demands more bytes
+        assert!(tls_record_expected_len(&multi[..rec1_len]).unwrap() > rec1_len);
+        // Once both records are present, expected length matches and SNI extracts cleanly
+        assert_eq!(tls_record_expected_len(&multi), Some(multi.len()));
+        assert_eq!(extract_tls_sni(&multi).as_deref(), Some("api.openai.com"));
+
+        // Zero-length Handshake record MUST be rejected
+        let mut zero_rec = vec![0x16, 0x03, 0x01, 0x00, 0x00];
+        zero_rec.extend_from_slice(&pkt);
+        assert_eq!(extract_tls_sni(&zero_rec), None);
     }
 
     #[test]

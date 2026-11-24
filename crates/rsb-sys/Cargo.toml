@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Zero-C-dependency Linux syscall wrappers (rustix linux_raw + raw clone3/Landlock/seccomp)"
 
 [dependencies]

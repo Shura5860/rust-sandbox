@@ -67,11 +67,12 @@ pub unsafe extern "C" fn rsb_exec_json(
         .into_raw()
 }
 
-/// Free a string pointer previously returned by [`rsb_exec_json`] or [`rsb_zygote_exec_json`].
+/// Free a string pointer previously returned by [`rsb_exec_json`],
+/// [`rsb_exec_profile_toml_json`], or [`rsb_zygote_exec_json`].
 ///
 /// # Safety
-/// `ptr` must either be NULL or a pointer previously returned by `rsb_exec_json` /
-/// `rsb_zygote_exec_json` that has not already been freed.
+/// `ptr` must either be NULL or a pointer previously returned by `rsb_exec_json`,
+/// `rsb_exec_profile_toml_json`, or `rsb_zygote_exec_json` that has not already been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rsb_string_free(ptr: *mut c_char) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -151,6 +152,125 @@ pub unsafe extern "C" fn rsb_zygote_exec_json(
     CString::new(json)
         .unwrap_or_else(|_| CString::new("{\"ok\":false,\"error\":\"nul in output\"}").unwrap())
         .into_raw()
+}
+
+/// Execute a command using a full declarative `sandbox.toml` profile string (supports
+/// `ro`, `ro_data`, `rw`, `ephemeral_cow`, `memory_mb`, `pids`, `cpu_pct`, `timeout_ms`,
+/// `allow_syscalls`, `hostname`, `rootfs`).
+///
+/// # Safety
+/// - `profile_toml` and `program` must be valid NUL-terminated UTF-8 C strings.
+/// - If `argv` is non-NULL and `argc > 0`, `argv` must point to at least `argc` valid strings.
+/// - Caller MUST free the returned pointer with [`rsb_string_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rsb_exec_profile_toml_json(
+    profile_toml: *const c_char,
+    program: *const c_char,
+    argv: *const *const c_char,
+    argc: usize,
+) -> *mut c_char {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_profile_ffi_impl(profile_toml, program, argv, argc)
+    }));
+    let json = match res {
+        Ok(Ok(s)) => s,
+        Ok(Err(msg)) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&msg)),
+        Err(_) => "{\"ok\":false,\"error\":\"internal panic in rsb_exec_profile_toml_json\"}".to_string(),
+    };
+    CString::new(json)
+        .unwrap_or_else(|_| CString::new("{\"ok\":false,\"error\":\"nul in output\"}").unwrap())
+        .into_raw()
+}
+
+fn run_profile_ffi_impl(
+    profile_toml: *const c_char,
+    program: *const c_char,
+    argv: *const *const c_char,
+    argc: usize,
+) -> Result<String, String> {
+    const MAX_ARGC: usize = 65_536;
+    if profile_toml.is_null() || program.is_null() {
+        return Err("profile_toml and program must not be null".into());
+    }
+    if argv.is_null() && argc > 0 {
+        return Err("argv is null while argc > 0".into());
+    }
+    if argc > MAX_ARGC {
+        return Err(format!("argc ({argc}) exceeds maximum allowed ({MAX_ARGC})"));
+    }
+    let toml_str = unsafe { CStr::from_ptr(profile_toml) }
+        .to_str()
+        .map_err(|_| "profile_toml is not valid UTF-8")?;
+    let prog_str = unsafe { CStr::from_ptr(program) }
+        .to_str()
+        .map_err(|_| "program is not valid UTF-8")?;
+
+    let profile = rsb_core::SandboxProfile::from_toml(toml_str).map_err(|e| e.to_string())?;
+    if !profile.allow_domains.is_empty()
+        || !profile.allow_cidrs.is_empty()
+        || profile.transparent_tap
+    {
+        return Err(
+            "rsb_exec_profile_toml_json does not enforce [network] allow_domains/allow_cidrs/transparent_tap rules; use the `rsb` CLI or `rsb-net` directly"
+                .into(),
+        );
+    }
+    let mut args = Vec::new();
+    if !argv.is_null() && argc > 0 {
+        args.reserve_exact(argc);
+        for i in 0..argc {
+            let p = unsafe { *argv.add(i) };
+            if p.is_null() {
+                return Err(format!("argv[{i}] is null"));
+            }
+            let s = unsafe { CStr::from_ptr(p) }
+                .to_str()
+                .map_err(|_| "argument is not valid UTF-8")?;
+            args.push(s.to_string());
+        }
+    }
+
+    let cap = Sandbox::builder(prog_str)
+        .args(&args)
+        .with_profile(&profile)
+        .run_captured(1024 * 1024)
+        .map_err(|e| e.to_string())?;
+
+    let r = &cap.report;
+    let exit_code = r.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "null".into());
+    let signal = r.signal.map(|s| s.to_string()).unwrap_or_else(|| "null".into());
+    let mut cow_diffs_json = String::from("[");
+    for (idx, d) in cap.cow_diffs.iter().enumerate() {
+        if idx > 0 {
+            cow_diffs_json.push(',');
+        }
+        let kind = match d.kind {
+            rsb_core::CowChangeKind::Added => "added",
+            rsb_core::CowChangeKind::Modified => "modified",
+            rsb_core::CowChangeKind::Deleted => "deleted",
+        };
+        cow_diffs_json.push_str(&format!(
+            "{{\"target\":\"{}\",\"path\":\"{}\",\"kind\":\"{}\"}}",
+            json_escape(&d.target.to_string_lossy()),
+            json_escape(&d.rel_path.to_string_lossy()),
+            kind
+        ));
+    }
+    cow_diffs_json.push(']');
+    Ok(format!(
+        "{{\"ok\":{},\"exit_code\":{},\"signal\":{},\"timed_out\":{},\"setup_ms\":{:.3},\"total_ms\":{:.3},\"stdout\":\"{}\",\"stderr\":\"{}\",\"stdout_truncated\":{},\"stderr_truncated\":{},\"cow_diffs\":{}}}",
+        r.success(),
+        exit_code,
+        signal,
+        r.timed_out,
+        r.setup_time.as_secs_f64() * 1000.0,
+        r.total_time.as_secs_f64() * 1000.0,
+        json_escape(&String::from_utf8_lossy(&cap.stdout)),
+        json_escape(&String::from_utf8_lossy(&cap.stderr)),
+        cap.stdout_truncated,
+        cap.stderr_truncated,
+        cow_diffs_json,
+    ))
 }
 
 /// Shut down and free a `ZygotePool` handle previously returned by [`rsb_zygote_start_python`].

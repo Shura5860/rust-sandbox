@@ -29,7 +29,19 @@ char *rsb_exec_json(
     int32_t use_namespaces
 );
 
-/* Free a string returned by `rsb_exec_json` or `rsb_zygote_exec_json`. */
+/*
+ * Run a sandboxed command configured by a full `sandbox.toml` profile string
+ * (supports ro, ro_data, rw, ephemeral_cow, limits, allow_syscalls, hostname, rootfs).
+ * Free the returned pointer with `rsb_string_free`. Thread-safe.
+ */
+char *rsb_exec_profile_toml_json(
+    const char *profile_toml,
+    const char *program,
+    const char *const *argv,
+    size_t argc
+);
+
+/* Free a string returned by `rsb_exec_json`, `rsb_exec_profile_toml_json`, or `rsb_zygote_exec_json`. */
 void rsb_string_free(char *ptr);
 
 /*

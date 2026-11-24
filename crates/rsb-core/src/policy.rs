@@ -309,6 +309,18 @@ impl SandboxBuilder {
         self
     }
 
+    /// Set block I/O bandwidth limit (`io.max` in Cgroups v2): `None` emits `max`.
+    pub fn io_max_bps(
+        mut self,
+        major: u32,
+        minor: u32,
+        rbps: Option<u64>,
+        wbps: Option<u64>,
+    ) -> Self {
+        self.policy.limits.io_max_bps = Some((major, minor, rbps, wbps));
+        self
+    }
+
     /// Set wall-clock execution timeout; child process group is killed with `SIGKILL` on expiry.
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.policy.limits.timeout = Some(duration);

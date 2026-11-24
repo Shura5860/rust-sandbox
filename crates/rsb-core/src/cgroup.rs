@@ -22,6 +22,8 @@ pub struct ResourceLimits {
     pub pids_max: Option<u32>,
     /// CPU quota as percentage of a single core (e.g. `25` = 25% of 1 core, `200` = 2 cores).
     pub cpu_quota_percent: Option<u32>,
+    /// Optional block I/O bandwidth limit (`io.max`): `(major, minor, rbps, wbps)` where `None` = `max`.
+    pub io_max_bps: Option<(u32, u32, Option<u64>, Option<u64>)>,
     /// Wall-clock execution timeout enforced by parent (`SIGKILL` on expiry).
     pub timeout: Option<Duration>,
     /// Open file descriptor soft/hard limit (`RLIMIT_NOFILE`, defaults to `256`).
@@ -32,11 +34,12 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    /// Returns `true` if any Cgroups v2 quota (`memory`, `pids`, or `cpu`) is configured.
+    /// Returns `true` if any Cgroups v2 quota (`memory`, `pids`, `cpu`, or `io`) is configured.
     pub fn has_cgroup_quotas(&self) -> bool {
         self.memory_max_bytes.is_some()
             || self.pids_max.is_some()
             || self.cpu_quota_percent.is_some()
+            || self.io_max_bps.is_some()
     }
 }
 
@@ -56,7 +59,7 @@ impl CgroupGuard {
             return Ok(None);
         }
 
-        let Some(parent_dir) = find_writable_cgroup_v2_dir() else {
+        let Some(parent_dir) = find_writable_cgroup_v2_dir_for(limits) else {
             if limits.strict_cgroup {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -83,7 +86,12 @@ impl CgroupGuard {
         // delegated controllers (e.g. Cgroups v2 "no internal processes" rule).
         if let Some(mem) = limits.memory_max_bytes {
             match fs::write(guard.dir.join("memory.max"), format!("{mem}\n")) {
-                Ok(()) => applied_any = true,
+                Ok(()) => {
+                    applied_any = true;
+                    // Best-effort disable swap so memory-limited sandboxes cannot evade
+                    // OOM enforcement by spilling gigabytes into host swap.
+                    let _ = fs::write(guard.dir.join("memory.swap.max"), b"0\n");
+                }
                 Err(e) if limits.strict_cgroup => return Err(e),
                 Err(_) => {}
             }
@@ -102,6 +110,23 @@ impl CgroupGuard {
             let period_us: u64 = 100_000;
             let quota_us: u64 = (pct as u64).saturating_mul(1_000).max(1_000);
             match fs::write(guard.dir.join("cpu.max"), format!("{quota_us} {period_us}\n")) {
+                Ok(()) => applied_any = true,
+                Err(e) if limits.strict_cgroup => return Err(e),
+                Err(_) => {}
+            }
+        }
+
+        if let Some((maj, min, rbps, wbps)) = limits.io_max_bps {
+            let r_str = rbps
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "max".to_string());
+            let w_str = wbps
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "max".to_string());
+            match fs::write(
+                guard.dir.join("io.max"),
+                format!("{maj}:{min} rbps={r_str} wbps={w_str}\n"),
+            ) {
                 Ok(()) => applied_any = true,
                 Err(e) if limits.strict_cgroup => return Err(e),
                 Err(_) => {}
@@ -156,8 +181,18 @@ impl Drop for CgroupGuard {
     }
 }
 
-/// Probe `/proc/self/cgroup` and check if the unified v2 hierarchy is writable.
+/// Probe `/proc/self/cgroup` and find a writable Cgroups v2 directory whose
+/// `cgroup.subtree_control` can delegate controllers to child leaves.
+///
+/// Under Linux Cgroups v2's *no internal processes* rule, the calling process's own
+/// cgroup often has an empty `cgroup.subtree_control`, whereas its parent (e.g. a
+/// delegated systemd user slice) has controllers enabled and allows creating sibling
+/// leaf cgroups. We prefer a directory with non-empty `cgroup.subtree_control`.
 pub fn find_writable_cgroup_v2_dir() -> Option<PathBuf> {
+    find_writable_cgroup_v2_dir_for(&ResourceLimits::default())
+}
+
+fn find_writable_cgroup_v2_dir_for(limits: &ResourceLimits) -> Option<PathBuf> {
     let content = fs::read_to_string("/proc/self/cgroup").ok()?;
     for line in content.lines() {
         // Unified cgroup v2 entry has format: `0::/path/to/cgroup`
@@ -168,12 +203,49 @@ pub fn find_writable_cgroup_v2_dir() -> Option<PathBuf> {
             } else {
                 PathBuf::from("/sys/fs/cgroup").join(rel_trimmed)
             };
+            // Prefer sibling creation under `full.parent()` when `full` lacks the
+            // requested subtree controllers (no-internal-processes rule), and `parent`
+            // has the requested controllers, is writable, and allows `cgroup.procs` migration.
+            if !has_requested_controllers(&full, limits)
+                && let Some(parent) = full.parent()
+                && parent.starts_with("/sys/fs/cgroup")
+                && has_requested_controllers(parent, limits)
+                && is_procs_writable(parent)
+                && is_dir_writable(parent)
+            {
+                return Some(parent.to_path_buf());
+            }
             if full.is_dir() && is_dir_writable(&full) {
                 return Some(full);
             }
         }
     }
     None
+}
+
+fn has_requested_controllers(dir: &Path, limits: &ResourceLimits) -> bool {
+    let Ok(raw) = fs::read_to_string(dir.join("cgroup.subtree_control")) else {
+        return false;
+    };
+    let enabled: Vec<&str> = raw.split_whitespace().collect();
+    if enabled.is_empty() {
+        return false;
+    }
+    if !limits.has_cgroup_quotas() {
+        return true;
+    }
+    let has = |name: &str| enabled.contains(&name);
+    (limits.memory_max_bytes.is_some() && has("memory"))
+        || (limits.pids_max.is_some() && has("pids"))
+        || (limits.cpu_quota_percent.is_some() && has("cpu"))
+        || (limits.io_max_bps.is_some() && has("io"))
+}
+
+fn is_procs_writable(dir: &Path) -> bool {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("cgroup.procs"))
+        .is_ok()
 }
 
 fn is_dir_writable(dir: &Path) -> bool {

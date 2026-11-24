@@ -10,7 +10,6 @@
 pub mod cgroup;
 mod child;
 pub mod error;
-#[cfg(target_arch = "x86_64")]
 pub mod learn;
 pub mod overlay;
 pub mod policy;
@@ -23,7 +22,6 @@ pub mod zygote;
 
 pub use cgroup::{ResourceLimits, find_writable_cgroup_v2_dir};
 pub use error::{ChildStage, SandboxError};
-#[cfg(target_arch = "x86_64")]
 pub use learn::{LearnReport, learn_policy, learn_policy_with_options};
 pub use overlay::{CowChange, CowChangeKind};
 pub use policy::{AccessMode, FsRule, NamespaceConfig, Sandbox, SandboxBuilder, SandboxPolicy};

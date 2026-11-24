@@ -7,18 +7,22 @@ members = [
     "crates/rsb-ffi",
     "crates/rsb-cli",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["Shura5860"]
 repository = "https://github.com/Shura5860/rust-sandbox"
+homepage = "https://github.com/Shura5860/rust-sandbox"
+keywords = ["linux", "sandbox", "landlock", "seccomp", "security"]
+categories = ["os::linux-apis", "command-line-utilities"]
 
 [workspace.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "thread", "mount", "pipe", "param", "stdio", "event"] }
-rsb-sys = { path = "crates/rsb-sys" }
-rsb-core = { path = "crates/rsb-core" }
-rsb-net = { path = "crates/rsb-net" }
+rsb-sys = { version = "0.2.0", path = "crates/rsb-sys" }
+rsb-core = { version = "0.2.0", path = "crates/rsb-core" }
+rsb-net = { version = "0.2.0", path = "crates/rsb-net" }
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }

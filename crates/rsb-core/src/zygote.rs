@@ -32,6 +32,7 @@ pub struct ZygoteConfig {
     pub allow_network: bool,
     pub ro_paths: Vec<PathBuf>,
     pub rw_paths: Vec<PathBuf>,
+    pub limits: crate::cgroup::ResourceLimits,
 }
 
 impl Default for ZygoteConfig {
@@ -50,6 +51,7 @@ impl Default for ZygoteConfig {
             allow_network: false,
             ro_paths: Vec::new(),
             rw_paths: Vec::new(),
+            limits: crate::cgroup::ResourceLimits::default(),
         }
     }
 }
@@ -177,7 +179,7 @@ while True:
         try:
             exec(compile(code, "<rsb-zygote>", "exec"), {"__name__": "__main__"})
         except SystemExit as e:
-            exit_code = e.code if isinstance(e.code, int) else 1
+            exit_code = 0 if e.code is None else (e.code if isinstance(e.code, int) else 1)
         except BaseException:
             traceback.print_exc()
             exit_code = 1
@@ -305,6 +307,7 @@ pub struct NodeZygoteConfig {
     pub allow_network: bool,
     pub ro_paths: Vec<PathBuf>,
     pub rw_paths: Vec<PathBuf>,
+    pub limits: crate::cgroup::ResourceLimits,
 }
 
 impl Default for NodeZygoteConfig {
@@ -317,6 +320,7 @@ impl Default for NodeZygoteConfig {
             allow_network: false,
             ro_paths: Vec::new(),
             rw_paths: Vec::new(),
+            limits: crate::cgroup::ResourceLimits::default(),
         }
     }
 }
@@ -332,7 +336,7 @@ impl Default for NodeZygoteConfig {
 /// protocol FDs (`stdio: ['ignore', 'pipe', 'pipe']`).
 const NODE_ZYGOTE_BOOTSTRAP: &str = r#"
 const fs = require('fs');
-const { spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 
 function writeAll(fd, buf) {
   let off = 0;
@@ -354,6 +358,7 @@ function sendFrame(buf) {
 }
 
 const MAX_FRAME = 16 * 1024 * 1024;
+const MAX_OUT = 1024 * 1024;
 
 function readExact(n) {
   if (n > MAX_FRAME) return null;
@@ -372,63 +377,122 @@ function readExact(n) {
   return out;
 }
 
-sendFrame(Buffer.from('READY'));
-
-while (true) {
-  const hdr = readExact(4);
-  if (!hdr) break;
-  const len = hdr.readUInt32BE(0);
-  if (len > MAX_FRAME) break;
-  const body = readExact(len);
-  if (!body || body.length < 4) break;
-
-  const timeoutMs = body.readUInt32BE(0);
-  const code = body.slice(4).toString('utf8');
-  const t0 = process.hrtime.bigint();
-
-  // Separate OS process per request: inherits Landlock + Seccomp-BPF from kernel,
-  // has zero access to Zygote memory or protocol FDs 0/1!
-  let res;
-  try {
+function runWorker(code, timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = process.hrtime.bigint();
     if (code.indexOf('\0') !== -1) {
-      res = { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from('code contains NUL byte\n') };
-    } else {
-      res = spawnSync(process.execPath, ['-e', code], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: timeoutMs > 0 ? timeoutMs : undefined,
-        maxBuffer: 1024 * 1024,
-        killSignal: 'SIGKILL',
+      return resolve({
+        exitCode: 1,
+        timedOut: 0,
+        elapsedUs: Number((process.hrtime.bigint() - t0) / 1000n),
+        outBuf: Buffer.alloc(0),
+        errBuf: Buffer.from('code contains NUL byte\n'),
       });
     }
-  } catch (e) {
-    res = { status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from(String(e) + '\n') };
-  }
+    let child;
+    try {
+      // Spawn in its own process group (`detached: true`) with isolated stdio so
+      // untrusted code cannot access protocol FDs and timeout SIGKILL terminates
+      // all spawned grandchildren (`process.kill(-child.pid, 'SIGKILL')`).
+      child = spawn(process.execPath, ['-e', code], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
+      });
+    } catch (e) {
+      return resolve({
+        exitCode: 1,
+        timedOut: 0,
+        elapsedUs: Number((process.hrtime.bigint() - t0) / 1000n),
+        outBuf: Buffer.alloc(0),
+        errBuf: Buffer.from(String(e) + '\n'),
+      });
+    }
 
-  const elapsedUs = Number((process.hrtime.bigint() - t0) / 1000n);
-  const timedOut = (res.error && res.error.code === 'ETIMEDOUT') ? 1 : 0;
-  let exitCode = 0;
-  if (timedOut) {
-    exitCode = 124;
-  } else if (typeof res.status === 'number') {
-    exitCode = res.status;
-  } else if (res.signal) {
-    exitCode = 128;
-  } else {
-    exitCode = 1;
-  }
+    const outChunks = [];
+    const errChunks = [];
+    let outLen = 0;
+    let errLen = 0;
+    let timedOut = 0;
+    let finished = false;
+    let timer = null;
 
-  const outBuf = res.stdout ? Buffer.from(res.stdout) : Buffer.alloc(0);
-  const errBuf = res.stderr ? Buffer.from(res.stderr) : Buffer.alloc(0);
-  const resp = Buffer.alloc(17 + outBuf.length + 4 + errBuf.length);
-  resp.writeInt32BE(exitCode, 0);
-  resp.writeUInt8(timedOut, 4);
-  resp.writeBigUInt64BE(BigInt(elapsedUs), 5);
-  resp.writeUInt32BE(outBuf.length, 13);
-  outBuf.copy(resp, 17);
-  resp.writeUInt32BE(errBuf.length, 17 + outBuf.length);
-  errBuf.copy(resp, 21 + outBuf.length);
-  sendFrame(resp);
+    const finish = (exitCode) => {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      resolve({
+        exitCode,
+        timedOut,
+        elapsedUs: Number((process.hrtime.bigint() - t0) / 1000n),
+        outBuf: Buffer.concat(outChunks),
+        errBuf: Buffer.concat(errChunks),
+      });
+    };
+
+    child.stdout.on('data', (chunk) => {
+      if (outLen < MAX_OUT) {
+        const take = chunk.slice(0, MAX_OUT - outLen);
+        outChunks.push(take);
+        outLen += take.length;
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      if (errLen < MAX_OUT) {
+        const take = chunk.slice(0, MAX_OUT - errLen);
+        errChunks.push(take);
+        errLen += take.length;
+      }
+    });
+
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = 1;
+        if (child.pid) {
+          try { process.kill(-child.pid, 'SIGKILL'); } catch (_) {}
+          try { process.kill(child.pid, 'SIGKILL'); } catch (_) {}
+        }
+        try { child.stdout.destroy(); } catch (_) {}
+        try { child.stderr.destroy(); } catch (_) {}
+        finish(124);
+      }, timeoutMs);
+    }
+
+    child.on('error', (e) => {
+      errChunks.push(Buffer.from(String(e) + '\n'));
+      finish(1);
+    });
+    child.on('close', (code, sig) => {
+      const ec = timedOut ? 124 : (typeof code === 'number' ? code : (sig ? 128 : 1));
+      finish(ec);
+    });
+  });
 }
+
+(async () => {
+  sendFrame(Buffer.from('READY'));
+  while (true) {
+    const hdr = readExact(4);
+    if (!hdr) break;
+    const len = hdr.readUInt32BE(0);
+    if (len > MAX_FRAME) break;
+    const body = readExact(len);
+    if (!body || body.length < 4) break;
+
+    const timeoutMs = body.readUInt32BE(0);
+    const code = body.slice(4).toString('utf8');
+    const r = await runWorker(code, timeoutMs);
+
+    const resp = Buffer.alloc(17 + r.outBuf.length + 4 + r.errBuf.length);
+    resp.writeInt32BE(r.exitCode, 0);
+    resp.writeUInt8(r.timedOut, 4);
+    resp.writeBigUInt64BE(BigInt(r.elapsedUs), 5);
+    resp.writeUInt32BE(r.outBuf.length, 13);
+    r.outBuf.copy(resp, 17);
+    resp.writeUInt32BE(r.errBuf.length, 17 + r.outBuf.length);
+    r.errBuf.copy(resp, 21 + r.outBuf.length);
+    sendFrame(resp);
+  }
+})();
 "#;
 
 impl ZygotePool {
@@ -451,6 +515,24 @@ impl ZygotePool {
         }
         for p in &cfg.rw_paths {
             builder = builder.rw(p);
+        }
+        if let Some(mem) = cfg.limits.memory_max_bytes {
+            builder = builder.memory_limit_bytes(mem);
+        }
+        if let Some(pids) = cfg.limits.pids_max {
+            builder = builder.pids_limit(pids);
+        }
+        if let Some(cpu) = cfg.limits.cpu_quota_percent {
+            builder = builder.cpu_quota_percent(cpu);
+        }
+        if let Some((maj, min, rbps, wbps)) = cfg.limits.io_max_bps {
+            builder = builder.io_max_bps(maj, min, rbps, wbps);
+        }
+        if let Some(nofile) = cfg.limits.rlimit_nofile {
+            builder = builder.rlimit_nofile(nofile);
+        }
+        if cfg.limits.strict_cgroup {
+            builder = builder.strict_cgroup(true);
         }
 
         let mut child = builder.prepare()?.spawn_piped()?;
@@ -496,6 +578,24 @@ impl ZygotePool {
         }
         for p in &cfg.rw_paths {
             builder = builder.rw(p);
+        }
+        if let Some(mem) = cfg.limits.memory_max_bytes {
+            builder = builder.memory_limit_bytes(mem);
+        }
+        if let Some(pids) = cfg.limits.pids_max {
+            builder = builder.pids_limit(pids);
+        }
+        if let Some(cpu) = cfg.limits.cpu_quota_percent {
+            builder = builder.cpu_quota_percent(cpu);
+        }
+        if let Some((maj, min, rbps, wbps)) = cfg.limits.io_max_bps {
+            builder = builder.io_max_bps(maj, min, rbps, wbps);
+        }
+        if let Some(nofile) = cfg.limits.rlimit_nofile {
+            builder = builder.rlimit_nofile(nofile);
+        }
+        if cfg.limits.strict_cgroup {
+            builder = builder.strict_cgroup(true);
         }
 
         let mut child = builder.prepare()?.spawn_piped()?;

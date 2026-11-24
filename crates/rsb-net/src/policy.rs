@@ -26,26 +26,48 @@ impl CidrRule {
             return Err("empty CIDR rule".into());
         }
 
-        // Handle bracketed IPv6: `[2001:db8::/32]:443` or `[2001:db8::]:443`
+        // Handle bracketed IPv6:
+        // `[2001:db8::/32]:443`, `[2001:db8::]:443`, `[2001:db8::]/32:443`, `[2001:db8::]/32`
         if let Some(rest) = s.strip_prefix('[') {
             let Some((inside, after)) = rest.split_once(']') else {
                 return Err(format!("unclosed `[` in CIDR rule '{s}'"));
             };
-            let port = if let Some(p) = after.strip_prefix(':') {
-                Some(p.parse::<u16>().map_err(|_| format!("invalid port '{p}'"))?)
+            let (ip_str, inside_prefix) = match inside.split_once('/') {
+                Some((ip, pre)) => (
+                    ip,
+                    Some(
+                        pre.parse::<u8>()
+                            .map_err(|_| format!("invalid prefix '{pre}'"))?,
+                    ),
+                ),
+                None => (inside, None),
+            };
+            let (after_prefix, port) = if let Some(after_slash) = after.strip_prefix('/') {
+                if inside_prefix.is_some() {
+                    return Err(format!("duplicate prefix length in '{s}'"));
+                }
+                let (pre_str, port_opt) = match after_slash.split_once(':') {
+                    Some((pre, p)) => (
+                        pre,
+                        Some(p.parse::<u16>().map_err(|_| format!("invalid port '{p}'"))?),
+                    ),
+                    None => (after_slash, None),
+                };
+                let pre = pre_str
+                    .parse::<u8>()
+                    .map_err(|_| format!("invalid prefix '{pre_str}'"))?;
+                (Some(pre), port_opt)
+            } else if let Some(p) = after.strip_prefix(':') {
+                (
+                    None,
+                    Some(p.parse::<u16>().map_err(|_| format!("invalid port '{p}'"))?),
+                )
             } else if after.is_empty() {
-                None
+                (None, None)
             } else {
                 return Err(format!("unexpected trailing characters in '{s}'"));
             };
-            let (ip_str, prefix) = match inside.split_once('/') {
-                Some((ip, pre)) => (
-                    ip,
-                    pre.parse::<u8>()
-                        .map_err(|_| format!("invalid prefix '{pre}'"))?,
-                ),
-                None => (inside, 128),
-            };
+            let prefix = inside_prefix.or(after_prefix).unwrap_or(128);
             let v6: Ipv6Addr = ip_str
                 .parse()
                 .map_err(|_| format!("invalid IPv6 address '{ip_str}'"))?;
@@ -211,8 +233,10 @@ pub struct EgressPolicy {
     /// both `allow_domains` and `allow_cidrs`**. Set `.block_private_ips(false)` explicitly
     /// if you intend to allow traffic to a private or loopback CIDR.
     pub block_private_ips: bool,
-    /// Require TLS SNI to match the requested domain on port 443.
+    /// Require TLS SNI to match the requested domain on port 443 (and any TLS port).
     pub verify_tls_sni: bool,
+    /// Optional egress bandwidth cap in bytes/sec enforced by `SlirpBridge`.
+    pub max_egress_bps: Option<u64>,
 }
 
 impl Default for EgressPolicy {
@@ -222,11 +246,16 @@ impl Default for EgressPolicy {
             allow_cidrs: Vec::new(),
             block_private_ips: true,
             verify_tls_sni: true,
+            max_egress_bps: None,
         }
     }
 }
 
 impl EgressPolicy {
+    pub fn max_egress_bps(mut self, bps: u64) -> Self {
+        self.max_egress_bps = Some(bps);
+        self
+    }
     pub fn allow_domain(mut self, spec: &str) -> Result<Self, String> {
         self.allow_domains.push(DomainRule::parse(spec)?);
         Ok(self)
@@ -405,5 +434,15 @@ mod tests {
         // Public NAT64 / 6to4 destinations remain allowed when domain is validated
         assert!(pol.check_ip("64:ff9b::1.1.1.1".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
         assert!(pol.check_ip("2002:0101:0101::1".parse().unwrap(), 443, Some("api.openai.com")).is_allowed());
+
+        // Bracketed IPv6 CIDR rules: `[IPv6]/PREFIX:PORT` and `[IPv6]/PREFIX`
+        let r1 = CidrRule::parse("[2001:db8::]/32:443").unwrap();
+        assert_eq!(r1.prefix_len, 32);
+        assert_eq!(r1.port, Some(443));
+        assert!(r1.matches("2001:db8::1".parse().unwrap(), 443));
+        assert!(!r1.matches("2001:db8::1".parse().unwrap(), 80));
+        let r2 = CidrRule::parse("[2001:db8::]/32").unwrap();
+        assert_eq!(r2.prefix_len, 32);
+        assert_eq!(r2.port, None);
     }
 }

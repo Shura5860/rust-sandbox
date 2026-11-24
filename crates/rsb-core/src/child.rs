@@ -177,6 +177,7 @@ pub(crate) fn child_main(
             if let Some(resolv_src) = resolv_tmp {
                 let _ = mount_bind(resolv_src, c"./etc/resolv.conf");
             }
+            setup_minimal_dev();
             let _ = mount(
                 c"proc",
                 c"./proc",
@@ -244,10 +245,14 @@ pub(crate) fn child_main(
         fail_child(err_tx, ChildStage::NoNewPrivs, e.0);
     }
 
-    // 6. Apply Landlock LSM filesystem confinement AFTER CLONE_NEWNS so each
-    //    `O_PATH` FD binds to the child's own mount namespace `vfsmount`.
+    // 6. Apply Landlock LSM confinement (FS v1+, TCP net v4+, IPC scope v6+) AFTER
+    //    CLONE_NEWNS so each `O_PATH` FD binds to the child's own mount namespace `vfsmount`.
     if prepared.landlock_abi.is_some() {
-        let ruleset = match landlock::create_ruleset(prepared.landlock_handled_fs) {
+        let ruleset = match landlock::create_ruleset_ex(
+            prepared.landlock_handled_fs,
+            prepared.landlock_handled_net,
+            prepared.landlock_scoped,
+        ) {
             Ok(fd) => fd,
             Err(e) => fail_child(err_tx, ChildStage::LandlockCreate, e.0),
         };
@@ -356,6 +361,8 @@ fn mask_proc_entries(relative: bool) {
             c"./proc/acpi",
             c"./proc/scsi",
             c"./proc/asound",
+            c"./sys/firmware",
+            c"./sys/kernel",
         ]
     } else {
         &[
@@ -366,6 +373,8 @@ fn mask_proc_entries(relative: bool) {
             c"/proc/acpi",
             c"/proc/scsi",
             c"/proc/asound",
+            c"/sys/firmware",
+            c"/sys/kernel",
         ]
     };
     let files: &[&core::ffi::CStr] = if relative {
@@ -395,6 +404,40 @@ fn mask_proc_entries(relative: bool) {
     }
     for &f in files {
         let _ = mount_bind(c"/dev/null", f);
+    }
+}
+
+/// Mount a minimal `tmpfs` `/dev` inside a custom `rootfs` (before `pivot_root`)
+/// and bind-mount only safe virtual devices (`null`, `zero`, `full`, `random`, `urandom`, `tty`).
+fn setup_minimal_dev() {
+    let dev_flags = MountFlags::NOSUID | MountFlags::NOEXEC;
+    if mount(c"tmpfs", c"./dev", c"tmpfs", dev_flags, c"size=65536,mode=0755").is_err() {
+        return;
+    }
+    const DEVICES: &[(&core::ffi::CStr, &core::ffi::CStr)] = &[
+        (c"/dev/null", c"./dev/null"),
+        (c"/dev/zero", c"./dev/zero"),
+        (c"/dev/full", c"./dev/full"),
+        (c"/dev/random", c"./dev/random"),
+        (c"/dev/urandom", c"./dev/urandom"),
+        (c"/dev/tty", c"./dev/tty"),
+    ];
+    for &(src, dst) in DEVICES {
+        if let Ok(fd) = openat(
+            CWD,
+            dst,
+            OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        ) {
+            drop(fd);
+            if mount_bind(src, dst).is_err() {
+                let _ = rsb_sys::rustix::fs::unlinkat(
+                    CWD,
+                    dst,
+                    rsb_sys::rustix::fs::AtFlags::empty(),
+                );
+            }
+        }
     }
 }
 
