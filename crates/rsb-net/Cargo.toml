@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Zero-C-dependency L3/L4/L7 egress filter, TLS SNI verifier, DNS filter, and smoltcp rootless TAP bridge for rust-sandbox"

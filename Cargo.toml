@@ -17,6 +17,7 @@ license = "MIT OR Apache-2.0"
 authors = ["Shura5860"]
 repository = "https://github.com/Shura5860/rust-sandbox"
 homepage = "https://github.com/Shura5860/rust-sandbox"
+readme = "README.md"
 keywords = ["linux", "sandbox", "landlock", "seccomp", "security"]
 categories = ["os::linux-apis", "command-line-utilities"]
 
